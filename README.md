@@ -4,7 +4,7 @@
 
 Krita adapter for the DCC Model Context Protocol ecosystem.
 
-![Krita game-art workflow](docs/images/dcc-mcp-krita-showcase.gif)
+![Krita game-art workflow](docs/images/dcc-mcp-krita-showcase.webp)
 
 The adapter uses a small Krita Python plug-in and a loopback JSON-lines bridge.
 The MCP server runs in the normal Python environment; KRITA API calls stay inside
