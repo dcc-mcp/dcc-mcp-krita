@@ -1,36 +1,40 @@
-# dcc-mcp-gimp
+# dcc-mcp-krita
 
-GIMP 3 adapter for the DCC Model Context Protocol ecosystem.
+![DCC-MCP Krita](docs/images/dcc-mcp-krita.svg)
 
-The adapter uses a small GIMP 3 Python plug-in and a loopback JSON-lines bridge.
-The MCP server runs in the normal Python environment; GIMP API calls stay inside
+Krita adapter for the DCC Model Context Protocol ecosystem.
+
+![Krita game-art workflow](docs/images/dcc-mcp-krita-showcase.gif)
+
+The adapter uses a small Krita Python plug-in and a loopback JSON-lines bridge.
+The MCP server runs in the normal Python environment; KRITA API calls stay inside
 the plug-in process. It does not expose arbitrary Python or Script-Fu execution.
 
 ## Install
 
 ```bash
-pip install dcc-mcp-gimp
-dcc-mcp-gimp-install
+pip install dcc-mcp-krita
+dcc-mcp-krita-install
 ```
 
-Restart GIMP, run **Filters → Development → DCC-MCP GIMP Bridge**, then start:
+Restart Krita, enable the bundled Python plug-in, then start:
 
 ```bash
-dcc-mcp-gimp
+dcc-mcp-krita
 ```
 
 The MCP endpoint defaults to `http://127.0.0.1:8767/mcp`; the plug-in bridge uses
-`127.0.0.1:3848`. Override the latter with `DCC_MCP_GIMP_BRIDGE_PORT` before
+`127.0.0.1:3848`. Override the latter with `DCC_MCP_KRITA_BRIDGE_PORT` before
 starting both processes.
 
 ## Current tools
 
-- Check GIMP bridge status and version.
+- Check KRITA bridge status and version.
 - List open images with dimensions.
 - Inspect the active image.
 
 The first release targets safe session discovery. Image mutation and export will
-be added only through typed GIMP procedures, not arbitrary source evaluation.
+be added only through typed KRITA procedures, not arbitrary source evaluation.
 
 ## Development
 
@@ -43,4 +47,4 @@ python -m build
 python -m twine check dist/*
 ```
 
-GIMP 3 plug-in API reference: https://developer.gimp.org/api/3.0/
+Krita plug-in API reference: https://developer.krita.org/api/3.0/
