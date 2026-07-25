@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Service
+X-KDE-ServiceTypes=Krita/PythonPlugin
+X-Python-2-Compatible=false
+X-Krita-Version=28
+Name=DCC MCP Krita
+Comment=DCC MCP integration for Krita — AI-driven automation bridge

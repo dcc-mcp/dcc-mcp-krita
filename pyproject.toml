@@ -33,7 +33,8 @@ packages = ["src/dcc_mcp_krita"]
 artifacts = ["src/dcc_mcp_krita/skills/**"]
 
 [tool.hatch.build.targets.wheel.force-include]
-"bridge/krita-plugin/dcc_mcp_krita.py" = "dcc_mcp_krita/krita_plugin/dcc_mcp_krita.py"
+"bridge/krita-plugin/dcc_mcp_krita.desktop" = "dcc_mcp_krita/krita_plugin/dcc_mcp_krita.desktop"
+"bridge/krita-plugin/dcc_mcp_krita/__init__.py" = "dcc_mcp_krita/krita_plugin/dcc_mcp_krita/__init__.py"
 
 [tool.hatch.build.targets.sdist]
 include = ["src/dcc_mcp_krita", "bridge", "tests", "README.md", "LICENSE", "CHANGELOG.md", "tools"]
