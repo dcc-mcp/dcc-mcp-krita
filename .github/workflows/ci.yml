@@ -13,5 +13,5 @@ jobs:
       - run: python -m pytest
       - run: python -m ruff check src tests tools
       - run: python tools/lint_skills.py
-      - run: python -m py_compile bridge/krita-plugin/dcc_mcp_krita.py
+      - run: python -m py_compile bridge/krita-plugin/dcc_mcp_krita/__init__.py
       - run: python -m build && python -m twine check dist/*
