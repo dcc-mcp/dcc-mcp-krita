@@ -14,6 +14,7 @@ import pytest
 class TestDefaultPykritaDir:
     """Platform-specific pykrita directory resolution."""
 
+    @pytest.mark.skipif(os.name != "nt", reason="WindowsPath not available on Linux")
     def test_windows_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(os, "name", "nt")
         monkeypatch.setenv("APPDATA", "C:\\Users\\test\\AppData\\Roaming")
@@ -22,6 +23,7 @@ class TestDefaultPykritaDir:
         result = default_pykrita_dir()
         assert result == Path("C:/Users/test/AppData/Roaming/krita/pykrita")
 
+    @pytest.mark.skipif(os.name != "nt", reason="WindowsPath not available on Linux")
     def test_windows_fallback_home(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(os, "name", "nt")
         monkeypatch.delenv("APPDATA", raising=False)
