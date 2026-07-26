@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
 import os
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -127,6 +130,35 @@ class TestPluginModule:
         init_path = repo_root / "bridge" / "krita-plugin" / "dcc_mcp_krita" / "__init__.py"
         source = init_path.read_text(encoding="utf-8")
         ast.parse(source)
+
+    def test_plugin_imports_and_registers_with_krita(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The plugin loads with Krita's runtime module and registers its extension."""
+        registered_extensions: list[object] = []
+        app = types.SimpleNamespace(addExtension=registered_extensions.append)
+
+        class FakeExtension:
+            def __init__(self, parent: object) -> None:
+                self.parent = parent
+
+        class FakeKrita:
+            @staticmethod
+            def instance() -> object:
+                return app
+
+        krita_module = types.ModuleType("krita")
+        krita_module.Extension = FakeExtension  # type: ignore[attr-defined]
+        krita_module.Krita = FakeKrita  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "krita", krita_module)
+
+        repo_root = Path(__file__).resolve().parents[1]
+        init_path = repo_root / "bridge" / "krita-plugin" / "dcc_mcp_krita" / "__init__.py"
+        spec = importlib.util.spec_from_file_location("_dcc_mcp_krita_plugin_test", init_path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        assert len(registered_extensions) == 1
+        assert isinstance(registered_extensions[0], module.DccMcpKritaExtension)
 
     def test_plugin_init_contains_menu_actions(self) -> None:
         """The plugin module defines the three unified menu action functions."""

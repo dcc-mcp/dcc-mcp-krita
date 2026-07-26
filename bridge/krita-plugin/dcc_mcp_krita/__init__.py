@@ -16,10 +16,7 @@ import socketserver
 import sys
 import threading
 
-# The Krita module is only available inside Krita's embedded Python.
-# This typing-only import silences static analysis without affecting runtime.
-if False:  # pragma: no cover
-    from krita import Extension, Krita  # noqa: F401
+from krita import Extension, Krita
 
 BRIDGE_PORT: int = int(os.environ.get("DCC_MCP_KRITA_BRIDGE_PORT", "3848"))
 
