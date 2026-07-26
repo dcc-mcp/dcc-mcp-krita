@@ -29,7 +29,7 @@ _bridge_server: socketserver.ThreadingTCPServer | None = None
 
 # ── Version (hard-coded to avoid import-time side-effects) ───────────────────
 
-VERSION: str = "0.1.0"
+VERSION: str = "0.2.0"
 
 # ── Bridge server ────────────────────────────────────────────────────────────
 
