@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/dcc-mcp/dcc-mcp-krita/compare/v0.2.0...v0.2.1) (2026-07-26)
+
+
+### Bug Fixes
+
+* load Krita runtime API during plugin import ([bf3acc0](https://github.com/dcc-mcp/dcc-mcp-krita/commit/bf3acc0f650ad16f5a6bab663ab4f36bb57568e2))
+
 ## [0.2.0](https://github.com/dcc-mcp/dcc-mcp-krita/compare/v0.1.0...v0.2.0) (2026-07-25)
 
 
