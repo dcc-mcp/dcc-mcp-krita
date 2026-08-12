@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0
+
+- Replace the session-only bridge with 16 typed document, layer, painting, save, and export tools.
+- Marshal every LibKis operation through a bounded Qt UI-thread queue.
+- Add loopback authentication, allowed roots, size limits, destructive opt-ins, and artifact hashes.
+- Add staged plug-in installation with rollback and a machine-readable doctor command.
+- Validate Python 3.9/3.12, Skill packaging, workflows, and final distributions.
+
 ## [0.2.0](https://github.com/dcc-mcp/dcc-mcp-krita/compare/v0.1.0...v0.2.0) (2026-07-25)
 
 

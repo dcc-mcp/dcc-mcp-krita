@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dcc-mcp-krita"
-version = "0.2.0"
-description = "Krita adapter for the DCC Model Context Protocol"
+version = "0.3.0"
+description = "Typed document, layer, painting, and export automation for Krita"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
@@ -14,7 +14,7 @@ keywords = ["krita", "image-editing", "mcp", "dcc", "automation"]
 dependencies = ["dcc-mcp-core>=0.19.38,<1.0.0"]
 
 [project.optional-dependencies]
-dev = ["build>=1.2", "pytest>=8", "ruff>=0.8", "twine>=6"]
+dev = ["build>=1.2", "pytest>=8", "ruff>=0.8", "tomli>=2; python_version < '3.11'", "twine>=7.0; python_version >= '3.10'"]
 
 [project.urls]
 Homepage = "https://github.com/dcc-mcp/dcc-mcp-krita"
@@ -24,6 +24,7 @@ Issues = "https://github.com/dcc-mcp/dcc-mcp-krita/issues"
 [project.scripts]
 dcc-mcp-krita = "dcc_mcp_krita.server:main"
 dcc-mcp-krita-install = "dcc_mcp_krita.install:main"
+dcc-mcp-krita-doctor = "dcc_mcp_krita.install:doctor_main"
 
 [project.entry-points."dcc_mcp.adapters"]
 krita = "dcc_mcp_krita:KritaMcpServer"
@@ -35,9 +36,11 @@ artifacts = ["src/dcc_mcp_krita/skills/**"]
 [tool.hatch.build.targets.wheel.force-include]
 "bridge/krita-plugin/dcc_mcp_krita.desktop" = "dcc_mcp_krita/krita_plugin/dcc_mcp_krita.desktop"
 "bridge/krita-plugin/dcc_mcp_krita/__init__.py" = "dcc_mcp_krita/krita_plugin/dcc_mcp_krita/__init__.py"
+"bridge/krita-plugin/dcc_mcp_krita/runtime.py" = "dcc_mcp_krita/krita_plugin/dcc_mcp_krita/runtime.py"
 
 [tool.hatch.build.targets.sdist]
-include = ["src/dcc_mcp_krita", "bridge", "tests", "README.md", "LICENSE", "CHANGELOG.md", "tools"]
+include = ["src/dcc_mcp_krita", "bridge", "docs", "tests", "README.md", "LICENSE", "CHANGELOG.md", "tools"]
+exclude = ["docs/**/*.png", "docs/**/*.svg", "docs/**/*.webp"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
