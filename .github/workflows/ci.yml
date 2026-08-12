@@ -5,13 +5,20 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: {python-version: "3.12"}
+        with: {python-version: "${{ matrix.python-version }}"}
       - run: python -m pip install -e ".[dev]"
-      - run: python -m pytest
-      - run: python -m ruff check src tests tools
+      - run: python -m pytest -q
+      - run: python -m ruff check src tests tools bridge
+      - run: python -m ruff format --check src tests tools bridge
       - run: python tools/lint_skills.py
-      - run: python -m py_compile bridge/krita-plugin/dcc_mcp_krita/__init__.py
-      - run: python -m build && python -m twine check dist/*
+      - run: python -m py_compile bridge/krita-plugin/dcc_mcp_krita/__init__.py bridge/krita-plugin/dcc_mcp_krita/runtime.py
+      - run: python -m build
+      - if: matrix.python-version == '3.12'
+        run: python -m twine check dist/*

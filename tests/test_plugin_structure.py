@@ -11,6 +11,11 @@ from pathlib import Path
 
 import pytest
 
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
+
 # ── Install tests ────────────────────────────────────────────────────────────
 
 
@@ -66,6 +71,7 @@ class TestInstall:
         install(tmp_path)
         assert (tmp_path / "dcc_mcp_krita.desktop").is_file()
         assert (tmp_path / "dcc_mcp_krita" / "__init__.py").is_file()
+        assert (tmp_path / "dcc_mcp_krita" / "runtime.py").is_file()
 
     def test_install_desktop_content(self, tmp_path: Path) -> None:
         """Desktop entry file contains the expected metadata."""
@@ -104,6 +110,37 @@ class TestInstall:
         install(tmp_path)
         # Module should still be present after second install
         assert (tmp_path / "dcc_mcp_krita" / "__init__.py").is_file()
+
+    def test_install_rolls_back_both_entries_when_promotion_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import dcc_mcp_krita.install as installer
+
+        installer.install(tmp_path)
+        marker = tmp_path / "dcc_mcp_krita" / "previous.txt"
+        marker.write_text("previous", encoding="utf-8")
+        real_replace = installer.os.replace
+
+        def fail_module_promotion(source: str, destination: str) -> None:
+            if ".dcc-mcp-krita-install-" in source and Path(destination).name == "dcc_mcp_krita":
+                raise OSError("simulated promotion failure")
+            real_replace(source, destination)
+
+        monkeypatch.setattr(installer.os, "replace", fail_module_promotion)
+        with pytest.raises(OSError, match="simulated"):
+            installer.install(tmp_path)
+        assert marker.read_text(encoding="utf-8") == "previous"
+        assert (tmp_path / "dcc_mcp_krita.desktop").is_file()
+        assert not list(tmp_path.glob(".*.backup-*"))
+
+    def test_doctor_reports_installation_without_token_value(self, tmp_path: Path) -> None:
+        from dcc_mcp_krita.install import doctor, install
+
+        assert doctor(tmp_path)["ready"] is False
+        install(tmp_path)
+        result = doctor(tmp_path)
+        assert result["ready"] is True
+        assert "token" not in result
 
 
 # ── Plugin module validation ─────────────────────────────────────────────────
@@ -152,9 +189,14 @@ class TestPluginModule:
 
         repo_root = Path(__file__).resolve().parents[1]
         init_path = repo_root / "bridge" / "krita-plugin" / "dcc_mcp_krita" / "__init__.py"
-        spec = importlib.util.spec_from_file_location("_dcc_mcp_krita_plugin_test", init_path)
+        spec = importlib.util.spec_from_file_location(
+            "_dcc_mcp_krita_plugin_test",
+            init_path,
+            submodule_search_locations=[str(init_path.parent)],
+        )
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, spec.name, module)
         spec.loader.exec_module(module)
 
         assert len(registered_extensions) == 1
@@ -203,11 +245,7 @@ class TestVersionConsistency:
     def test_pyproject_version_matches_init(self) -> None:
         """pyproject.toml version matches src/dcc_mcp_krita/__version__.py."""
         repo_root = Path(__file__).resolve().parents[1]
-        import tomllib
-
-        pyproject = tomllib.loads(
-            (repo_root / "pyproject.toml").read_text(encoding="utf-8")
-        )
+        pyproject = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))
         pyproject_version = pyproject["project"]["version"]
 
         # Read __version__.py
@@ -219,15 +257,11 @@ class TestVersionConsistency:
     def test_pyproject_version_matches_plugin_init(self) -> None:
         """pyproject.toml version matches the hard-coded VERSION in the plugin."""
         repo_root = Path(__file__).resolve().parents[1]
-        import tomllib
-
-        pyproject = tomllib.loads(
-            (repo_root / "pyproject.toml").read_text(encoding="utf-8")
-        )
+        pyproject = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))
         pyproject_version = pyproject["project"]["version"]
 
-        init_path = repo_root / "bridge" / "krita-plugin" / "dcc_mcp_krita" / "__init__.py"
-        source = init_path.read_text(encoding="utf-8")
+        runtime_path = repo_root / "bridge" / "krita-plugin" / "dcc_mcp_krita" / "runtime.py"
+        source = runtime_path.read_text(encoding="utf-8")
         assert f'VERSION: str = "{pyproject_version}"' in source
 
 
@@ -245,8 +279,8 @@ class TestPythonCompliance:
         # ``from __future__ import annotations``. Test that the plugin uses the
         # future import and parses cleanly.
         repo_root = Path(__file__).resolve().parents[1]
-        init_path = repo_root / "bridge" / "krita-plugin" / "dcc_mcp_krita" / "__init__.py"
-        source = init_path.read_text(encoding="utf-8")
+        runtime_path = repo_root / "bridge" / "krita-plugin" / "dcc_mcp_krita" / "runtime.py"
+        source = runtime_path.read_text(encoding="utf-8")
         tree = ast.parse(source)
         # The file must have the future import as its first import
         assert any(
