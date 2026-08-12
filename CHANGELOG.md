@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.0](https://github.com/dcc-mcp/dcc-mcp-krita/compare/v0.2.0...v0.3.0) (2026-08-12)
+
+
+### Features
+
+* ship production-ready Krita authoring ([#5](https://github.com/dcc-mcp/dcc-mcp-krita/issues/5)) ([98573d8](https://github.com/dcc-mcp/dcc-mcp-krita/commit/98573d8c7093361691cb89255ecb34148d49447b))
+
+
+### Bug Fixes
+
+* load Krita runtime API during plugin import ([bf3acc0](https://github.com/dcc-mcp/dcc-mcp-krita/commit/bf3acc0f650ad16f5a6bab663ab4f36bb57568e2))
+
 ## 0.3.0
 
 - Replace the session-only bridge with 16 typed document, layer, painting, save, and export tools.
