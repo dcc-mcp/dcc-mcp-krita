@@ -22,7 +22,7 @@ Repository = "https://github.com/dcc-mcp/dcc-mcp-krita"
 Issues = "https://github.com/dcc-mcp/dcc-mcp-krita/issues"
 
 [project.scripts]
-dcc-mcp-krita = "dcc_mcp_krita.server:main"
+dcc-mcp-krita = "dcc_mcp_krita.cli:main"
 dcc-mcp-krita-install = "dcc_mcp_krita.install:main"
 dcc-mcp-krita-doctor = "dcc_mcp_krita.install:doctor_main"
 
@@ -39,7 +39,7 @@ artifacts = ["src/dcc_mcp_krita/skills/**"]
 "bridge/krita-plugin/dcc_mcp_krita/runtime.py" = "dcc_mcp_krita/krita_plugin/dcc_mcp_krita/runtime.py"
 
 [tool.hatch.build.targets.sdist]
-include = ["src/dcc_mcp_krita", "bridge", "docs", "tests", "README.md", "LICENSE", "CHANGELOG.md", "tools"]
+include = ["src/dcc_mcp_krita", "bridge", "docs", "tests", "README.md", "install.md", "LICENSE", "CHANGELOG.md", "tools"]
 exclude = ["docs/**/*.png", "docs/**/*.svg", "docs/**/*.webp"]
 
 [tool.pytest.ini_options]

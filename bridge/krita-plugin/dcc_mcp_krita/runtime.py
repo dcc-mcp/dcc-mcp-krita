@@ -9,6 +9,7 @@ import os
 import queue
 import secrets
 import socketserver
+import sys
 import threading
 import time
 from pathlib import Path
@@ -281,6 +282,7 @@ def _execute_command(method: str, params: Mapping[str, Any]) -> Any:
             "ready": True,
             "krita_version": str(app.version()),
             "adapter_version": VERSION,
+            "python_version": sys.version.split()[0],
             "bridge_host": BRIDGE_HOST,
             "bridge_port": BRIDGE_PORT,
             "authenticated": True,

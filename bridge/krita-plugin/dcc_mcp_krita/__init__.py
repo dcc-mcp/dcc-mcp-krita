@@ -2,12 +2,44 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
+from datetime import datetime, timezone
+from pathlib import Path
 
 from krita import Extension, Krita
 
-from .runtime import VERSION, start_bridge, stop_bridge
+
+def _bootstrap_error_path() -> Path:
+    configured = os.environ.get("DCC_MCP_KRITA_BOOTSTRAP_ERRORS")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".dcc-mcp" / "krita-bootstrap-errors.jsonl"
+
+
+def _record_bootstrap_error(stage: str, error: Exception) -> None:
+    event = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "stage": stage,
+        "error_type": type(error).__name__,
+        "message": str(error)[:1000],
+        "adapter_version": globals().get("VERSION"),
+    }
+    try:
+        path = _bootstrap_error_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(event, ensure_ascii=True, separators=(",", ":")) + "\n")
+    except OSError:
+        pass
+
+
+try:
+    from .runtime import VERSION, start_bridge, stop_bridge
+except Exception as error:
+    _record_bootstrap_error("runtime_import", error)
+    raise
 
 
 def _set_clipboard_text(text: str) -> None:
@@ -83,7 +115,11 @@ class DccMcpKritaExtension(Extension):  # type: ignore[name-defined]  # noqa: F8
         super().__init__(parent)  # type: ignore[call-arg]
 
     def setup(self) -> None:
-        start_bridge()
+        try:
+            start_bridge()
+        except Exception as error:
+            _record_bootstrap_error("start_bridge", error)
+            raise
 
     def createActions(self, window: object) -> None:  # noqa: N802
         copy_action = window.createAction(
