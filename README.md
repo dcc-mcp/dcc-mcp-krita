@@ -39,7 +39,7 @@ access are intentionally outside the contract.
 
 ```bash
 pip install dcc-mcp-krita
-dcc-mcp-krita-install
+dcc-mcp-krita install --dcc-path /path/to/krita --yes
 ```
 
 Restart Krita, open **Settings → Configure Krita → Python Plugin Manager**, and
@@ -62,8 +62,13 @@ secret source.
 Inspect installation state without revealing the token:
 
 ```bash
-dcc-mcp-krita-doctor
+dcc-mcp-krita status --dcc-path /path/to/krita --json
+dcc-mcp-krita verify --dcc-path /path/to/krita --json
 ```
+
+See the [installation and lifecycle guide](install.md) for platform paths,
+upgrade/uninstall, stable exit codes, recovery, and troubleshooting. The legacy
+`dcc-mcp-krita-install` and `dcc-mcp-krita-doctor` commands remain compatible.
 
 ## Safety model
 

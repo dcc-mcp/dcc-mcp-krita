@@ -375,6 +375,7 @@ def test_dispatch_executes_on_pump_thread(runtime) -> None:
     thread.join(timeout=1)
     assert result["main_thread_id"] == threading.get_ident()
     assert result["command_count"] == 16
+    assert result["python_version"] == sys.version.split()[0]
 
 
 def test_bridge_rejects_invalid_token_without_dispatch(runtime) -> None:

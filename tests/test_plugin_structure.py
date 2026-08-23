@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import json
 import os
 import sys
 import types
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -44,6 +45,7 @@ class TestDefaultPykritaDir:
     @pytest.mark.skipif(os.name == "nt", reason="PosixPath not available on Windows")
     def test_linux_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(os, "name", "posix")
+        monkeypatch.setattr(sys, "platform", "linux")
         monkeypatch.setenv("XDG_DATA_HOME", "/home/test/.local/share")
         from dcc_mcp_krita.install import default_pykrita_dir
 
@@ -53,12 +55,27 @@ class TestDefaultPykritaDir:
     @pytest.mark.skipif(os.name == "nt", reason="PosixPath not available on Windows")
     def test_linux_fallback_home(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(os, "name", "posix")
+        monkeypatch.setattr(sys, "platform", "linux")
         monkeypatch.delenv("XDG_DATA_HOME", raising=False)
         monkeypatch.setattr(Path, "home", lambda: Path("/home/test"))
         from dcc_mcp_krita.install import default_pykrita_dir
 
         result = default_pykrita_dir()
         assert result == Path("/home/test/.local/share/krita/pykrita")
+
+    def test_macos_default_uses_krita_resource_profile(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from dcc_mcp_krita.install import default_pykrita_dir
+
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.delenv("APPDATA", raising=False)
+        monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: PurePosixPath("/Users/test"))
+
+        result = default_pykrita_dir()
+
+        assert result.as_posix() == "/Users/test/Library/Application Support/Krita/pykrita"
 
 
 class TestInstall:
@@ -133,13 +150,19 @@ class TestInstall:
         assert (tmp_path / "dcc_mcp_krita.desktop").is_file()
         assert not list(tmp_path.glob(".*.backup-*"))
 
-    def test_doctor_reports_installation_without_token_value(self, tmp_path: Path) -> None:
+    def test_doctor_reports_installation_without_token_value(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         from dcc_mcp_krita.install import doctor, install
 
+        monkeypatch.setenv("DCC_MCP_KRITA_CONFIG", str(tmp_path / "kritarc"))
         assert doctor(tmp_path)["ready"] is False
         install(tmp_path)
         result = doctor(tmp_path)
         assert result["ready"] is True
+        assert result["plugin_enabled"] is False
+        assert result["receipt_present"] is False
+        assert result["directly_usable"] is False
         assert "token" not in result
 
 
@@ -201,6 +224,52 @@ class TestPluginModule:
 
         assert len(registered_extensions) == 1
         assert isinstance(registered_extensions[0], module.DccMcpKritaExtension)
+
+    def test_plugin_captures_bridge_bootstrap_failures(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        registered_extensions: list[object] = []
+        app = types.SimpleNamespace(addExtension=registered_extensions.append)
+
+        class FakeExtension:
+            def __init__(self, parent: object) -> None:
+                self.parent = parent
+
+        class FakeKrita:
+            @staticmethod
+            def instance() -> object:
+                return app
+
+        krita_module = types.ModuleType("krita")
+        krita_module.Extension = FakeExtension  # type: ignore[attr-defined]
+        krita_module.Krita = FakeKrita  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "krita", krita_module)
+        error_log = tmp_path / "bootstrap-errors.jsonl"
+        monkeypatch.setenv("DCC_MCP_KRITA_BOOTSTRAP_ERRORS", str(error_log))
+        repo_root = Path(__file__).resolve().parents[1]
+        init_path = repo_root / "bridge" / "krita-plugin" / "dcc_mcp_krita" / "__init__.py"
+        spec = importlib.util.spec_from_file_location(
+            "_dcc_mcp_krita_plugin_bootstrap_test",
+            init_path,
+            submodule_search_locations=[str(init_path.parent)],
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, spec.name, module)
+        spec.loader.exec_module(module)
+        monkeypatch.setattr(
+            module,
+            "start_bridge",
+            lambda: (_ for _ in ()).throw(RuntimeError("bridge startup failed")),
+        )
+
+        with pytest.raises(RuntimeError, match="bridge startup failed"):
+            registered_extensions[0].setup()  # type: ignore[attr-defined]
+
+        event = json.loads(error_log.read_text(encoding="utf-8"))
+        assert event["stage"] == "start_bridge"
+        assert event["error_type"] == "RuntimeError"
+        assert event["adapter_version"] == "0.3.0"
 
     def test_plugin_init_contains_menu_actions(self) -> None:
         """The plugin module defines the three unified menu action functions."""
