@@ -269,7 +269,7 @@ class TestPluginModule:
         event = json.loads(error_log.read_text(encoding="utf-8"))
         assert event["stage"] == "start_bridge"
         assert event["error_type"] == "RuntimeError"
-        assert event["adapter_version"] == "0.3.0"
+        assert event["adapter_version"] == module.VERSION
 
     def test_plugin_init_contains_menu_actions(self) -> None:
         """The plugin module defines the three unified menu action functions."""

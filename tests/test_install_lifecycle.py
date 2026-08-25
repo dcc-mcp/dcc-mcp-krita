@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from dcc_mcp_krita.__version__ import __version__ as ADAPTER_VERSION
+
 
 def test_standard_lifecycle_round_trip_writes_and_consumes_receipt(
     tmp_path: Path, monkeypatch
@@ -28,7 +30,7 @@ def test_standard_lifecycle_round_trip_writes_and_consumes_receipt(
         dcc_path=dcc_path,
         python_path=Path(sys.executable),
         destination=destination,
-        version="0.3.0",
+        version=ADAPTER_VERSION,
         yes=True,
     )
 
@@ -140,7 +142,7 @@ def test_repair_uninstall_restores_preexisting_plugin_files(tmp_path: Path, monk
         dcc_path=dcc_path,
         python_path=Path(sys.executable),
         destination=destination,
-        version="0.3.0",
+        version=ADAPTER_VERSION,
         yes=True,
         repair=True,
     )
@@ -464,7 +466,7 @@ def test_verify_requires_enabled_plugin_and_authenticated_live_status(
                 "ready": True,
                 "authenticated": True,
                 "krita_version": "5.2.11",
-                "adapter_version": "0.3.0",
+                "adapter_version": ADAPTER_VERSION,
                 "python_version": "3.10.12",
             }
 
@@ -508,7 +510,7 @@ def test_verify_reports_bootstrap_error_recorded_after_install(tmp_path: Path, m
                 "ready": True,
                 "authenticated": True,
                 "krita_version": "5.2.11",
-                "adapter_version": "0.3.0",
+                "adapter_version": ADAPTER_VERSION,
                 "python_version": "3.10.12",
             }
 
@@ -538,7 +540,7 @@ def test_verify_reports_bootstrap_error_recorded_after_install(tmp_path: Path, m
                 "stage": "start_bridge",
                 "error_type": "RuntimeError",
                 "message": "bridge startup failed",
-                "adapter_version": "0.3.0",
+                "adapter_version": ADAPTER_VERSION,
             }
         )
         + "\n",
@@ -562,7 +564,7 @@ def test_live_status_rejects_unsupported_embedded_python(monkeypatch) -> None:
                 "ready": True,
                 "authenticated": True,
                 "krita_version": "5.2.11",
-                "adapter_version": "0.3.0",
+                "adapter_version": ADAPTER_VERSION,
                 "python_version": "3.8.18",
             }
 
