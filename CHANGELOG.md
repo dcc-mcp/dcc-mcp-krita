@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/dcc-mcp/dcc-mcp-krita/compare/v0.3.0...v0.4.0) (2026-08-25)
+
+
+### Features
+
+* standardize Krita install lifecycle ([793089c](https://github.com/dcc-mcp/dcc-mcp-krita/commit/793089c32cfca40a1366a5c0e9ac137c0e243bda))
+
 ## [0.3.0](https://github.com/dcc-mcp/dcc-mcp-krita/compare/v0.2.0...v0.3.0) (2026-08-12)
 
 

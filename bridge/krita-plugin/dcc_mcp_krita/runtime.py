@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
-VERSION: str = "0.3.0"  # x-release-please-version
+VERSION: str = "0.4.0"  # x-release-please-version
 BRIDGE_HOST = "127.0.0.1"
 BRIDGE_PORT = int(os.environ.get("DCC_MCP_KRITA_BRIDGE_PORT", "3848"))
 MAX_REQUEST_BYTES = 1024 * 1024
