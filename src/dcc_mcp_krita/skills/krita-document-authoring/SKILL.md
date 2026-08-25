@@ -12,7 +12,7 @@ metadata:
   dcc-mcp:
     dcc: krita
     layer: domain
-    version: "0.3.0"  # x-release-please-version
+    version: "0.4.0"  # x-release-please-version
     search-hint: "Krita document layer paint rectangle PNG texture sprite export"
     tags: [krita, digital-painting, textures, layers, game-art, export]
     tools: tools.yaml
