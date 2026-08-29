@@ -350,6 +350,48 @@ def test_uninstall_rejects_missing_receipt_backup_before_mutation(
     assert (destination / "dcc_mcp_krita.desktop").is_file()
 
 
+def test_uninstall_returns_structured_failure_for_replaced_receipt_container(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import dcc_mcp_krita.install as installer
+    from dcc_mcp_krita.install import LifecycleRequest, run_lifecycle
+
+    class Probe:
+        returncode = 0
+        stdout = "Krita 5.2.11\n"
+
+    monkeypatch.setattr(installer.subprocess, "run", lambda *args, **kwargs: Probe())
+    destination = tmp_path / "krita" / "pykrita"
+    dcc_path = tmp_path / "Host" / "krita.exe"
+    dcc_path.parent.mkdir()
+    dcc_path.touch()
+    request = LifecycleRequest(
+        operation="install",
+        dcc_path=dcc_path,
+        python_path=Path(sys.executable),
+        destination=destination,
+        yes=True,
+    )
+    assert run_lifecycle(request)["exit_code"] == 0
+    receipts = destination / ".dcc-mcp" / "receipts"
+    saved_receipts = destination / ".dcc-mcp" / "receipts-saved"
+    receipts.rename(saved_receipts)
+    external = tmp_path / "external-receipts"
+    external.mkdir()
+    try:
+        os.symlink(external, receipts, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        saved_receipts.rename(receipts)
+        pytest.skip("symlink creation is unavailable")
+
+    result = run_lifecycle(request.with_operation("uninstall"))
+
+    assert result["exit_code"] == 10
+    assert result["stage"] == "receipt"
+    assert result["status"] == "failed"
+    assert not (external / "krita.json").exists()
+
+
 def test_uninstall_fails_closed_for_unreceipted_partial_install(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1157,22 +1199,26 @@ def test_uninstall_rejects_parent_swap_between_validation_and_unlink(
     )
     original_init = installer._ReceiptParentHandle.__init__
     parent_handles = 0
+    module_opened = False
 
     def redirect_reopened_parent(handle: object, path: Path) -> None:
-        nonlocal parent_handles
+        nonlocal parent_handles, module_opened
         parent_handles += 1
         # A vulnerable second pass reopens the module parent by pathname; make
         # that reacquisition resolve to a byte-identical attacker directory.
-        if parent_handles > 2 and path.resolve() == module.resolve():
+        if path.resolve() == module.resolve() and module_opened:
             original_init(handle, attacker)
         else:
             original_init(handle, path)
+            if path.resolve() == module.resolve():
+                module_opened = True
 
     monkeypatch.setattr(installer._ReceiptParentHandle, "__init__", redirect_reopened_parent)
     result = run_lifecycle(request.with_operation("uninstall"))
 
     assert result["exit_code"] == 0
-    assert parent_handles == expected_parent_handles
+    # Uninstall also holds the receipt container itself through deletion.
+    assert parent_handles == expected_parent_handles + 1
     assert not module.exists()
     assert (attacker / "runtime.py").is_file()
 

@@ -257,6 +257,20 @@ def _write_json(path: Path, value: Mapping[str, Any]) -> None:
     _atomic_write(path, (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8"))
 
 
+def _safe_restore_receipt(destination: Path, prior_receipt: Optional[bytes]) -> None:
+    """Restore a receipt without allowing a replaced container to escape root."""
+    try:
+        path = _receipt_path(destination)
+        if prior_receipt is None:
+            path.unlink(missing_ok=True)
+        else:
+            _atomic_write(path, prior_receipt)
+    except (LifecycleFailure, OSError):
+        # The original lifecycle failure remains the source of truth.  Never
+        # turn recovery of an unsafe receipt container into an uncaught error.
+        return
+
+
 def _read_receipt(destination: Path) -> Optional[dict[str, Any]]:
     path = _receipt_path(destination)
     if not path.is_file():
@@ -447,16 +461,16 @@ class _ReceiptParentHandle:
         expected_identity: Optional[tuple[int, int, int, int]] = None,
         expected_digest: Optional[str] = None,
     ) -> None:
-        if expected_identity is not None and self.child_identity(name) != expected_identity:
+        if expected_identity is not None and self._child_identity(name) != expected_identity:
             raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path changed")
-        if expected_digest is not None and self.digest(name) != expected_digest:
+        if expected_digest is not None and self._digest(name) != expected_digest:
             raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path changed")
         if self.fd is not None:
             os.unlink(name, dir_fd=self.fd)
         else:
             os.unlink(str(self.physical_path / name))
 
-    def digest(self, name: str) -> str:
+    def _digest(self, name: str) -> str:
         """Hash a child opened relative to this validated parent handle."""
         # Windows CRT descriptors default to text mode and normalize CRLF,
         # which would make receipt hashes differ from the bytes on disk.
@@ -481,7 +495,10 @@ class _ReceiptParentHandle:
         finally:
             os.close(descriptor)
 
-    def child_identity(self, name: str) -> tuple[int, int, int, int]:
+    def digest(self, name: str) -> str:
+        return self._digest(name)
+
+    def _child_identity(self, name: str) -> tuple[int, int, int, int]:
         """Return a no-follow identity for a child under this parent handle."""
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
         if self.fd is not None:
@@ -508,6 +525,9 @@ class _ReceiptParentHandle:
             )
         finally:
             os.close(descriptor)
+
+    def child_identity(self, name: str) -> tuple[int, int, int, int]:
+        return self._child_identity(name)
 
     def close(self) -> None:
         if self.fd is not None:
@@ -936,7 +956,15 @@ def _result(
     directly_usable: bool = False,
 ) -> dict[str, Any]:
     """Build the thin adapter-local result envelope pending the shared Core facade."""
-    receipt = _receipt_path(destination) if destination is not None else None
+    if destination is not None:
+        try:
+            receipt = _receipt_path(destination)
+        except (LifecycleFailure, OSError):
+            # Keep failure reporting structured even when the receipt
+            # container itself is a reparse point or otherwise unsafe.
+            receipt = destination / _RECEIPT_RELATIVE
+    else:
+        receipt = None
     return {
         "schema_version": _SCHEMA_VERSION,
         "operation": request.operation,
@@ -1121,10 +1149,7 @@ def run_lifecycle(request: LifecycleRequest) -> dict[str, Any]:
             except BaseException:
                 _restore_backup(destination, rollback)
                 _remove_backup(destination, rollback)
-                if prior_receipt is None:
-                    _receipt_path(destination).unlink(missing_ok=True)
-                else:
-                    _atomic_write(_receipt_path(destination), prior_receipt)
+                _safe_restore_receipt(destination, prior_receipt)
                 raise
             if receipt is not None:
                 _remove_backup(destination, rollback)
@@ -1149,23 +1174,34 @@ def run_lifecycle(request: LifecycleRequest) -> dict[str, Any]:
                 detected=detected,
             )
         rollback = _backup_existing(destination)
-        prior_receipt = _receipt_path(destination).read_bytes()
+        receipt_path = _receipt_path(destination)
+        prior_receipt = receipt_path.read_bytes()
+        receipt_parent = _ReceiptParentHandle(receipt_path.parent)
         try:
+            receipt_identity = receipt_parent.child_identity(receipt_path.name)
+            receipt_digest = receipt_parent.digest(receipt_path.name)
             _restore_backup(
                 destination,
                 receipt.get("backup", {}),
                 receipt.get("managed_files", []),
             )
-            _receipt_path(destination).unlink()
+            receipt_parent.revalidate()
+            receipt_parent.unlink(
+                receipt_path.name,
+                expected_identity=receipt_identity,
+                expected_digest=receipt_digest,
+            )
         except BaseException as exc:
             # Receipt validation failures are fail-closed: do not recursively
             # delete the plug-in tree while rolling back, because that could
             # remove an operator-owned replacement discovered in the race.
             if not (isinstance(exc, LifecycleFailure) and exc.stage == "receipt"):
                 _restore_backup(destination, rollback)
-            _atomic_write(_receipt_path(destination), prior_receipt)
+            _safe_restore_receipt(destination, prior_receipt)
             _remove_backup(destination, rollback)
             raise
+        finally:
+            receipt_parent.close()
         for obsolete_backup in (rollback, receipt.get("backup", {})):
             try:
                 _remove_backup(destination, obsolete_backup)
