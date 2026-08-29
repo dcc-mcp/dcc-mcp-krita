@@ -475,6 +475,10 @@ class _ReceiptParentHandle:
                 expected_digest is not None and actual_digest != expected_digest
             ):
                 raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path changed")
+            # Re-sample identity after content hashing. This closes the
+            # replacement seam between the final digest and quarantine unlink.
+            if self._child_identity(quarantine) != actual_identity:
+                raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path changed")
             self._unlink_name(quarantine)
             keep_quarantine = False
         finally:
