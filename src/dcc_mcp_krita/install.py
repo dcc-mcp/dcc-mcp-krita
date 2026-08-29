@@ -312,9 +312,25 @@ def _assert_no_reparse_components(root: Path, path: Path, label: str) -> None:
             raise LifecycleFailure(
                 EXIT_PREFLIGHT, "receipt", "Receipt %s cannot be inspected" % label
             ) from exc
-        is_junction = getattr(current, "is_junction", lambda: False)()
-        if stat.S_ISLNK(attributes.st_mode) or is_junction:
+        if _is_reparse_point(current, attributes):
             raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt %s contains a link" % label)
+
+
+def _is_reparse_point(path: Path, attributes: Any) -> bool:
+    """Detect symlinks and Windows reparse points on Python 3.9+."""
+    if stat.S_ISLNK(attributes.st_mode):
+        return True
+    # Path.is_junction() was added in Python 3.12. Older Windows Python
+    # exposes FILE_ATTRIBUTE_REPARSE_POINT through st_file_attributes.
+    if int(getattr(attributes, "st_file_attributes", 0)) & 0x0400:
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if is_junction is None:
+        return False
+    try:
+        return bool(is_junction())
+    except (AttributeError, OSError, ValueError):
+        return False
 
 
 def _receipt_file_identity(path: Path, label: str) -> tuple[int, int, int, int]:
@@ -323,7 +339,7 @@ def _receipt_file_identity(path: Path, label: str) -> tuple[int, int, int, int]:
         attributes = os.lstat(str(path))
     except OSError as exc:
         raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt %s changed" % label) from exc
-    if stat.S_ISLNK(attributes.st_mode) or getattr(path, "is_junction", lambda: False)():
+    if _is_reparse_point(path, attributes):
         raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt %s contains a link" % label)
     if not stat.S_ISREG(attributes.st_mode):
         raise LifecycleFailure(
@@ -350,7 +366,7 @@ def _receipt_parent_identities(
             attributes = os.lstat(str(current))
         except OSError as exc:
             raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt %s changed" % label) from exc
-        if stat.S_ISLNK(attributes.st_mode) or getattr(current, "is_junction", lambda: False)():
+        if _is_reparse_point(current, attributes):
             raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt %s contains a link" % label)
         if not stat.S_ISDIR(attributes.st_mode):
             raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt parent is not a directory")

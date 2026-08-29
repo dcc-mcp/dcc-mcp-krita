@@ -997,3 +997,58 @@ def test_uninstall_fails_closed_when_managed_path_swaps_during_reacquisition(
     assert result["exit_code"] == 10
     assert result["stage"] == "receipt"
     assert operator_file.exists()
+
+
+def test_reparse_point_attribute_is_rejected_without_is_junction(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import stat
+
+    import dcc_mcp_krita.install as installer
+
+    root = tmp_path / "pykrita"
+    root.mkdir()
+    reparse = root / "junction"
+    victim = reparse / "victim.txt"
+
+    class ReparseStat:
+        st_mode = stat.S_IFDIR
+        st_file_attributes = 0x0400  # FILE_ATTRIBUTE_REPARSE_POINT
+
+    monkeypatch.setattr(
+        installer.os.path,
+        "lexists",
+        lambda value: str(value) in {str(root), str(reparse)},
+    )
+    monkeypatch.setattr(installer.os, "lstat", lambda _value: ReparseStat())
+
+    with pytest.raises(installer.LifecycleFailure, match="contains a link"):
+        installer._assert_no_reparse_components(root, victim, "managed file")
+
+
+def test_real_windows_junction_is_rejected_for_receipt_paths(tmp_path: Path) -> None:
+    if os.name != "nt":
+        pytest.skip("junction regression requires Windows")
+    import subprocess
+
+    import dcc_mcp_krita.install as installer
+
+    root = tmp_path / "pykrita"
+    outside = tmp_path / "operator"
+    junction = root / "junction"
+    root.mkdir()
+    outside.mkdir()
+    try:
+        result = subprocess.run(
+            ["cmd.exe", "/c", "mklink", "/J", str(junction), str(outside)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        pytest.skip("junction creation is unavailable on this runner")
+    if result.returncode != 0 or not junction.is_dir():
+        pytest.skip("junction creation is unavailable on this runner")
+
+    with pytest.raises(installer.LifecycleFailure, match="contains a link"):
+        installer._safe_receipt_path(root, "junction/victim.txt", "managed file")
