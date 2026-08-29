@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -276,15 +277,64 @@ def _read_receipt(destination: Path) -> Optional[dict[str, Any]]:
 def _safe_receipt_path(destination: Path, value: object, label: str) -> Path:
     if not isinstance(value, str) or not value or Path(value).is_absolute():
         raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt %s is unsafe" % label)
-    root = destination.resolve()
-    path = (destination / value).resolve()
+    # Normalize lexically without resolving symlinks.  Resolving here would
+    # turn a receipt path into an operator-owned target before deletion.
+    root = Path(os.path.abspath(str(destination)))
+    path = Path(os.path.abspath(os.path.join(str(destination), value)))
     try:
-        inside = os.path.commonpath((str(root), str(path))) == str(root)
+        inside = os.path.normcase(os.path.commonpath((str(root), str(path)))) == os.path.normcase(
+            str(root)
+        )
     except ValueError:
         inside = False
     if not inside:
         raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt %s escapes pykrita" % label)
+    _assert_no_reparse_components(root, path, label)
     return path
+
+
+def _assert_no_reparse_components(root: Path, path: Path, label: str) -> None:
+    """Reject symlink/junction components without following them."""
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise LifecycleFailure(
+            EXIT_PREFLIGHT, "receipt", "Receipt %s escapes pykrita" % label
+        ) from exc
+    current = root
+    for component in relative.parts:
+        current = current / component
+        if not os.path.lexists(str(current)):
+            continue
+        try:
+            attributes = os.lstat(str(current))
+        except OSError as exc:
+            raise LifecycleFailure(
+                EXIT_PREFLIGHT, "receipt", "Receipt %s cannot be inspected" % label
+            ) from exc
+        is_junction = getattr(current, "is_junction", lambda: False)()
+        if stat.S_ISLNK(attributes.st_mode) or is_junction:
+            raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt %s contains a link" % label)
+
+
+def _receipt_file_identity(path: Path, label: str) -> tuple[int, int, int, int]:
+    """Return a no-follow identity for an owned regular file."""
+    try:
+        attributes = os.lstat(str(path))
+    except OSError as exc:
+        raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt %s changed" % label) from exc
+    if stat.S_ISLNK(attributes.st_mode) or getattr(path, "is_junction", lambda: False)():
+        raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt %s contains a link" % label)
+    if not stat.S_ISREG(attributes.st_mode):
+        raise LifecycleFailure(
+            EXIT_PREFLIGHT, "receipt", "Receipt-owned path is not a regular file"
+        )
+    return (
+        int(attributes.st_dev),
+        int(attributes.st_ino),
+        int(attributes.st_size),
+        int(getattr(attributes, "st_mtime_ns", int(attributes.st_mtime * 1_000_000_000))),
+    )
 
 
 def _validate_receipt(destination: Path, receipt: Mapping[str, Any]) -> None:
@@ -326,8 +376,10 @@ def _validate_receipt(destination: Path, receipt: Mapping[str, Any]) -> None:
         allowed = relative == "%s.desktop" % _PLUGIN_NAME or relative.startswith(
             "%s/" % _PLUGIN_NAME
         )
-        if not allowed or path.is_symlink():
+        if not allowed:
             raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt owns an unexpected path")
+        if os.path.lexists(str(path)):
+            _receipt_file_identity(path, "managed file")
         if not re.fullmatch(r"[0-9a-f]{64}", str(record.get("sha256", ""))):
             raise LifecycleFailure(
                 EXIT_PREFLIGHT, "receipt", "Receipt managed file digest is invalid"
@@ -375,11 +427,15 @@ def _remove_receipt_owned_files(destination: Path, managed_files: list[Mapping[s
     """Remove only paths explicitly owned by a validated install receipt."""
     for record in managed_files:
         path = _safe_receipt_path(destination, record.get("path"), "managed file")
-        if path.exists() and not path.is_file():
-            raise LifecycleFailure(
-                EXIT_PREFLIGHT, "receipt", "Receipt-owned path is not a regular file"
-            )
-        path.unlink(missing_ok=True)
+        if not os.path.lexists(str(path)):
+            raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path is missing")
+        before = _receipt_file_identity(path, "managed file")
+        # Re-check the no-follow physical identity immediately before unlink;
+        # a replacement with a symlink or another inode fails closed.
+        after = _receipt_file_identity(path, "managed file")
+        if before != after:
+            raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path changed")
+        os.unlink(str(path))
     module = destination / _PLUGIN_NAME
     if module.is_dir():
         # Receipt entries own files, not directory containers.  Prune only
