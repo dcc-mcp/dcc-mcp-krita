@@ -469,17 +469,53 @@ class _ReceiptParentHandle:
         self._rename(name, quarantine)
         keep_quarantine = True
         try:
-            actual_identity = self._child_identity(quarantine)
-            actual_digest = self._digest(quarantine)
+
+            def sample() -> tuple[tuple[int, int, int, int], str]:
+                flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+                if self.fd is not None:
+                    descriptor = os.open(quarantine, flags, dir_fd=self.fd)
+                else:
+                    descriptor = os.open(str(self.physical_path / quarantine), flags)
+                try:
+                    attributes = os.fstat(descriptor)
+                    if _is_reparse_point(Path(quarantine), attributes) or not stat.S_ISREG(
+                        attributes.st_mode
+                    ):
+                        raise LifecycleFailure(
+                            EXIT_PREFLIGHT, "receipt", "Receipt-owned path is not a regular file"
+                        )
+                    digest = hashlib.sha256()
+                    while True:
+                        chunk = os.read(descriptor, 1024 * 1024)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                    identity = (
+                        int(attributes.st_dev),
+                        int(attributes.st_ino),
+                        int(attributes.st_size),
+                        int(
+                            getattr(
+                                attributes,
+                                "st_mtime_ns",
+                                int(attributes.st_mtime * 1_000_000_000),
+                            )
+                        ),
+                    )
+                    return identity, digest.hexdigest()
+                finally:
+                    os.close(descriptor)
+
+            actual_identity, actual_digest = sample()
             if (expected_identity is not None and actual_identity != expected_identity) or (
                 expected_digest is not None and actual_digest != expected_digest
             ):
                 raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path changed")
             # Re-sample identity after content hashing. This closes the
             # replacement seam between the final digest and quarantine unlink.
-            if self._child_identity(quarantine) != actual_identity:
+            if sample()[0] != actual_identity:
                 raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path changed")
-            self._unlink_name(quarantine, actual_identity, actual_digest)
+            self._unlink_name(quarantine)
             keep_quarantine = False
         finally:
             if keep_quarantine:
@@ -497,10 +533,10 @@ class _ReceiptParentHandle:
         expected_identity: Optional[tuple[int, int, int, int]] = None,
         expected_digest: Optional[str] = None,
     ) -> None:
-        if expected_identity is not None and self._child_identity(name) != expected_identity:
-            raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path changed")
-        if expected_digest is not None and self._digest(name) != expected_digest:
-            raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path changed")
+        # Ownership checks are completed by ``unlink`` while the entry is in
+        # quarantine. Keep this final operation deliberately non-interposable:
+        # no overridable identity/digest hook runs between validation and the
+        # single unlink syscall.
         if self.fd is not None:
             os.unlink(name, dir_fd=self.fd)
         else:
