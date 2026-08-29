@@ -337,6 +337,44 @@ def _receipt_file_identity(path: Path, label: str) -> tuple[int, int, int, int]:
     )
 
 
+def _receipt_parent_identities(
+    root: Path, path: Path, label: str
+) -> tuple[tuple[str, tuple[int, int]], ...]:
+    """Capture no-follow identities for every directory leading to a receipt file."""
+    relative = path.relative_to(root)
+    current = root
+    identities: list[tuple[str, tuple[int, int]]] = []
+    for component in relative.parts[:-1]:
+        current = current / component
+        try:
+            attributes = os.lstat(str(current))
+        except OSError as exc:
+            raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt %s changed" % label) from exc
+        if stat.S_ISLNK(attributes.st_mode) or getattr(current, "is_junction", lambda: False)():
+            raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt %s contains a link" % label)
+        if not stat.S_ISDIR(attributes.st_mode):
+            raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt parent is not a directory")
+        identities.append(
+            (
+                component,
+                (int(attributes.st_dev), int(attributes.st_ino)),
+            )
+        )
+    return tuple(identities)
+
+
+def _unlink_receipt_file(path: Path) -> None:
+    """Unlink a receipt file without following its final path component."""
+    if os.unlink in getattr(os, "supports_dir_fd", set()):
+        descriptor = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.unlink(path.name, dir_fd=descriptor)
+        finally:
+            os.close(descriptor)
+    else:
+        os.unlink(str(path))
+
+
 def _validate_receipt(destination: Path, receipt: Mapping[str, Any]) -> None:
     if receipt.get("adapter") != "krita" or receipt.get("version") != _ADAPTER_VERSION:
         raise LifecycleFailure(
@@ -425,17 +463,21 @@ def _remove_plugin_files(destination: Path) -> None:
 
 def _remove_receipt_owned_files(destination: Path, managed_files: list[Mapping[str, Any]]) -> None:
     """Remove only paths explicitly owned by a validated install receipt."""
+    root = Path(os.path.abspath(str(destination)))
     for record in managed_files:
         path = _safe_receipt_path(destination, record.get("path"), "managed file")
         if not os.path.lexists(str(path)):
             raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path is missing")
+        parent_before = _receipt_parent_identities(root, path, "managed file")
         before = _receipt_file_identity(path, "managed file")
         # Re-check the no-follow physical identity immediately before unlink;
         # a replacement with a symlink or another inode fails closed.
+        parent_after = _receipt_parent_identities(root, path, "managed file")
         after = _receipt_file_identity(path, "managed file")
-        if before != after:
+        if before != after or parent_before != parent_after:
             raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path changed")
-        os.unlink(str(path))
+        _assert_no_reparse_components(root, path, "managed file")
+        _unlink_receipt_file(path)
     module = destination / _PLUGIN_NAME
     if module.is_dir():
         # Receipt entries own files, not directory containers.  Prune only

@@ -948,3 +948,52 @@ def test_uninstall_rejects_receipt_file_replaced_by_symlink_to_unowned_file(
     assert result["exit_code"] == 10
     assert result["stage"] == "receipt"
     assert operator_file.exists()
+
+
+def test_uninstall_fails_closed_when_managed_path_swaps_during_reacquisition(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import dcc_mcp_krita.install as installer
+    from dcc_mcp_krita.install import LifecycleRequest, run_lifecycle
+
+    class Probe:
+        returncode = 0
+        stdout = "Krita 5.2.11\n"
+
+    monkeypatch.setattr(installer.subprocess, "run", lambda *args, **kwargs: Probe())
+    destination = tmp_path / "krita" / "pykrita"
+    dcc_path = tmp_path / "Host" / "krita.exe"
+    dcc_path.parent.mkdir()
+    dcc_path.touch()
+    request = LifecycleRequest(
+        operation="install",
+        dcc_path=dcc_path,
+        python_path=Path(sys.executable),
+        destination=destination,
+        yes=True,
+    )
+    assert run_lifecycle(request)["exit_code"] == 0
+    runtime = destination / "dcc_mcp_krita" / "runtime.py"
+    operator_file = destination / "operator.txt"
+    operator_file.write_bytes(runtime.read_bytes())
+    original_safe_path = installer._safe_receipt_path
+    runtime_calls = 0
+
+    def swap_after_validation(root: Path, value: object, label: str) -> Path:
+        nonlocal runtime_calls
+        if label == "managed file" and str(value).endswith("runtime.py"):
+            runtime_calls += 1
+            if runtime_calls == 2:
+                runtime.unlink()
+                try:
+                    runtime.symlink_to(operator_file)
+                except OSError:
+                    pytest.skip("symlink creation is unavailable on this runner")
+        return original_safe_path(root, value, label)
+
+    monkeypatch.setattr(installer, "_safe_receipt_path", swap_after_validation)
+    result = run_lifecycle(request.with_operation("uninstall"))
+
+    assert result["exit_code"] == 10
+    assert result["stage"] == "receipt"
+    assert operator_file.exists()
