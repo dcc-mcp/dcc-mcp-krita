@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError
@@ -587,14 +588,22 @@ def _remove_plugin_files(destination: Path) -> None:
 def _remove_receipt_owned_files(destination: Path, managed_files: list[Mapping[str, Any]]) -> None:
     """Remove only paths explicitly owned by a validated install receipt."""
     root = Path(os.path.abspath(str(destination)))
-    validated: list[tuple[Path, str]] = []
-    # Validate every receipt entry before mutating any of them. This keeps a
-    # race on a later entry from causing an earlier entry to be removed.
-    for record in managed_files:
-        path = _safe_receipt_path(destination, record.get("path"), "managed file")
-        if not os.path.lexists(str(path)):
-            raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path is missing")
-        with _ReceiptParentHandle(path.parent) as parent_handle:
+    validated: list[tuple[Path, str, _ReceiptParentHandle]] = []
+    parent_handles: dict[Path, _ReceiptParentHandle] = {}
+    # Keep every validated parent handle open through the final unlink pass.
+    # Reopening by pathname would allow an inter-phase parent swap to redirect
+    # deletion into an attacker-controlled directory.
+    with ExitStack() as handles:
+        # Validate every receipt entry before mutating any of them. This keeps
+        # a race on a later entry from causing an earlier entry to be removed.
+        for record in managed_files:
+            path = _safe_receipt_path(destination, record.get("path"), "managed file")
+            if not os.path.lexists(str(path)):
+                raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path is missing")
+            parent_handle = parent_handles.get(path.parent)
+            if parent_handle is None:
+                parent_handle = handles.enter_context(_ReceiptParentHandle(path.parent))
+                parent_handles[path.parent] = parent_handle
             parent_before = _receipt_parent_identities(root, path, "managed file")
             before = _receipt_file_identity(path, "managed file")
             # Re-check the no-follow physical identity immediately before
@@ -612,14 +621,11 @@ def _remove_receipt_owned_files(destination: Path, managed_files: list[Mapping[s
                 or content_digest != str(record.get("sha256", ""))
             ):
                 raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path changed")
-        validated.append((path, str(record.get("sha256", ""))))
+            validated.append((path, str(record.get("sha256", "")), parent_handle))
 
-    # Reacquire each validated parent and perform the final no-follow content
-    # check immediately before unlinking through that parent handle.
-    for path, expected_digest in validated:
-        if not os.path.lexists(str(path)):
-            raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path is missing")
-        with _ReceiptParentHandle(path.parent) as parent_handle:
+        # Perform the final no-follow content check and unlink through the same
+        # held parent handle used during validation.
+        for path, expected_digest, parent_handle in validated:
             parent_handle.revalidate()
             if parent_handle.digest(path.name) != expected_digest:
                 raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path changed")

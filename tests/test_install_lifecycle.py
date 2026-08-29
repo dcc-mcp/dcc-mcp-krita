@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -1115,6 +1116,54 @@ def test_uninstall_rejects_stable_replacement_after_identity_check(
     assert result["stage"] == "receipt"
     assert installer._receipt_file_identity(runtime, "managed file") != original_identity
     assert runtime.read_bytes() == replacement
+
+
+def test_uninstall_rejects_parent_swap_between_validation_and_unlink(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import dcc_mcp_krita.install as installer
+    from dcc_mcp_krita.install import LifecycleRequest, run_lifecycle
+
+    class Probe:
+        returncode = 0
+        stdout = "Krita 5.2.11\n"
+
+    monkeypatch.setattr(installer.subprocess, "run", lambda *args, **kwargs: Probe())
+    destination = tmp_path / "krita" / "pykrita"
+    dcc_path = tmp_path / "Host" / "krita.exe"
+    dcc_path.parent.mkdir()
+    dcc_path.touch()
+    request = LifecycleRequest(
+        operation="install",
+        dcc_path=dcc_path,
+        python_path=Path(sys.executable),
+        destination=destination,
+        yes=True,
+    )
+    assert run_lifecycle(request)["exit_code"] == 0
+    module = destination / "dcc_mcp_krita"
+    attacker = tmp_path / "attacker"
+    shutil.copytree(module, attacker)
+    original_init = installer._ReceiptParentHandle.__init__
+    parent_handles = 0
+
+    def redirect_reopened_parent(handle: object, path: Path) -> None:
+        nonlocal parent_handles
+        parent_handles += 1
+        # A vulnerable second pass reopens the module parent by pathname; make
+        # that reacquisition resolve to a byte-identical attacker directory.
+        if parent_handles > 2 and path.resolve() == module.resolve():
+            original_init(handle, attacker)
+        else:
+            original_init(handle, path)
+
+    monkeypatch.setattr(installer._ReceiptParentHandle, "__init__", redirect_reopened_parent)
+    result = run_lifecycle(request.with_operation("uninstall"))
+
+    assert result["exit_code"] == 0
+    assert parent_handles == 3
+    assert not module.exists()
+    assert (attacker / "runtime.py").is_file()
 
 
 def test_reparse_point_attribute_is_rejected_without_is_junction(
