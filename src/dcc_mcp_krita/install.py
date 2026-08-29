@@ -479,7 +479,7 @@ class _ReceiptParentHandle:
             # replacement seam between the final digest and quarantine unlink.
             if self._child_identity(quarantine) != actual_identity:
                 raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path changed")
-            self._unlink_name(quarantine)
+            self._unlink_name(quarantine, actual_identity, actual_digest)
             keep_quarantine = False
         finally:
             if keep_quarantine:
@@ -491,7 +491,16 @@ class _ReceiptParentHandle:
         else:
             os.rename(str(self.physical_path / source), str(self.physical_path / target))
 
-    def _unlink_name(self, name: str) -> None:
+    def _unlink_name(
+        self,
+        name: str,
+        expected_identity: Optional[tuple[int, int, int, int]] = None,
+        expected_digest: Optional[str] = None,
+    ) -> None:
+        if expected_identity is not None and self._child_identity(name) != expected_identity:
+            raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path changed")
+        if expected_digest is not None and self._digest(name) != expected_digest:
+            raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path changed")
         if self.fd is not None:
             os.unlink(name, dir_fd=self.fd)
         else:
