@@ -1172,6 +1172,55 @@ def test_uninstall_rejects_parent_swap_between_validation_and_unlink(
     assert (attacker / "runtime.py").is_file()
 
 
+def test_uninstall_rejects_same_content_replacement_after_final_digest(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import dcc_mcp_krita.install as installer
+    from dcc_mcp_krita.install import LifecycleRequest, run_lifecycle
+
+    class Probe:
+        returncode = 0
+        stdout = "Krita 5.2.11\n"
+
+    monkeypatch.setattr(installer.subprocess, "run", lambda *args, **kwargs: Probe())
+    destination = tmp_path / "krita" / "pykrita"
+    dcc_path = tmp_path / "Host" / "krita.exe"
+    dcc_path.parent.mkdir()
+    dcc_path.touch()
+    request = LifecycleRequest(
+        operation="install",
+        dcc_path=dcc_path,
+        python_path=Path(sys.executable),
+        destination=destination,
+        yes=True,
+    )
+    assert run_lifecycle(request)["exit_code"] == 0
+    runtime = destination / "dcc_mcp_krita" / "runtime.py"
+    original_digest = installer._ReceiptParentHandle.digest
+    runtime_digests = 0
+    replacement = runtime.read_bytes()
+    swapped = False
+
+    def replace_after_final_digest(handle: object, name: str) -> str:
+        nonlocal runtime_digests, swapped
+        digest = original_digest(handle, name)
+        if name == runtime.name and Path(handle.path).resolve() == runtime.parent.resolve():
+            runtime_digests += 1
+            if runtime_digests == 2:
+                runtime.unlink()
+                runtime.write_bytes(replacement)
+                swapped = True
+        return digest
+
+    monkeypatch.setattr(installer._ReceiptParentHandle, "digest", replace_after_final_digest)
+    result = run_lifecycle(request.with_operation("uninstall"))
+
+    assert swapped
+    assert result["exit_code"] == 10
+    assert result["stage"] == "receipt"
+    assert runtime.read_bytes() == replacement
+
+
 def test_reparse_point_attribute_is_rejected_without_is_junction(
     tmp_path: Path, monkeypatch
 ) -> None:

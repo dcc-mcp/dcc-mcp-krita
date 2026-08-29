@@ -472,6 +472,34 @@ class _ReceiptParentHandle:
         finally:
             os.close(descriptor)
 
+    def child_identity(self, name: str) -> tuple[int, int, int, int]:
+        """Return a no-follow identity for a child under this parent handle."""
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+        if self.fd is not None:
+            descriptor = os.open(name, flags, dir_fd=self.fd)
+        else:
+            descriptor = os.open(str(self.physical_path / name), flags)
+        try:
+            attributes = os.fstat(descriptor)
+            if _is_reparse_point(Path(name), attributes) or not stat.S_ISREG(attributes.st_mode):
+                raise LifecycleFailure(
+                    EXIT_PREFLIGHT, "receipt", "Receipt-owned path is not a regular file"
+                )
+            return (
+                int(attributes.st_dev),
+                int(attributes.st_ino),
+                int(attributes.st_size),
+                int(
+                    getattr(
+                        attributes,
+                        "st_mtime_ns",
+                        int(attributes.st_mtime * 1_000_000_000),
+                    )
+                ),
+            )
+        finally:
+            os.close(descriptor)
+
     def close(self) -> None:
         if self.fd is not None:
             os.close(self.fd)
@@ -627,9 +655,12 @@ def _remove_receipt_owned_files(destination: Path, managed_files: list[Mapping[s
         # held parent handle used during validation.
         for path, expected_digest, parent_handle in validated:
             parent_handle.revalidate()
+            before_identity = parent_handle.child_identity(path.name)
             if parent_handle.digest(path.name) != expected_digest:
                 raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path changed")
             parent_handle.revalidate()
+            if parent_handle.child_identity(path.name) != before_identity:
+                raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path changed")
             parent_handle.unlink(path.name)
     module = destination / _PLUGIN_NAME
     if module.is_dir():
