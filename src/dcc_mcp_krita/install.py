@@ -116,6 +116,21 @@ def _validate_source(source: Path) -> None:
         raise FileNotFoundError("Bundled Krita plug-in is incomplete: %s" % ", ".join(missing))
 
 
+def _core_safe_replace_tree(source: Path, destination: Path) -> None:
+    """Stage a tree through Core's lock-aware lifecycle primitive."""
+    try:
+        from dcc_mcp_core.install_lifecycle import safe_replace_tree
+    except ImportError:
+        shutil.copytree(source, destination)
+        return
+    result = safe_replace_tree(source, destination)
+    if not isinstance(result, Mapping) or not result.get("success"):
+        reason = "Core could not stage the Krita plug-in tree"
+        if isinstance(result, Mapping) and result.get("message"):
+            reason = str(result["message"])
+        raise OSError(reason)
+
+
 def install(destination: Optional[Path] = None) -> Path:
     """Atomically stage the desktop entry and Python package with rollback."""
     target = (destination or default_pykrita_dir()).expanduser().resolve()
@@ -134,7 +149,7 @@ def install(destination: Optional[Path] = None) -> Path:
         staged_desktop = staging / desktop_name
         staged_module = staging / _PLUGIN_NAME
         shutil.copy2(source / desktop_name, staged_desktop)
-        shutil.copytree(source / _PLUGIN_NAME, staged_module)
+        _core_safe_replace_tree(source / _PLUGIN_NAME, staged_module)
         if os.name != "nt":
             for python_file in staged_module.rglob("*.py"):
                 python_file.chmod(0o755)

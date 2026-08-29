@@ -807,3 +807,33 @@ def test_ci_runs_lifecycle_smoke_on_supported_operating_systems() -> None:
     assert "windows-latest" in workflow
     assert "macos-latest" in workflow
     assert "Lifecycle round-trip smoke" in workflow
+
+
+def test_install_uses_core_safe_replace_tree_for_staging(monkeypatch, tmp_path: Path) -> None:
+    """The adapter delegates staged tree copies to Core's lock-aware helper."""
+    import dcc_mcp_krita.install as installer
+
+    calls: list[tuple[Path, Path]] = []
+    real = installer._core_safe_replace_tree
+
+    def wrapped(source: Path, destination: Path) -> None:
+        calls.append((source, destination))
+        real(source, destination)
+
+    monkeypatch.setattr(installer, "_core_safe_replace_tree", wrapped)
+    installer.install(tmp_path)
+
+    assert calls
+    assert calls[0][0].name == "dcc_mcp_krita"
+    assert calls[0][1].name == "dcc_mcp_krita"
+
+
+def test_skill_guidance_exposes_lifecycle_entrypoint() -> None:
+    skill = (
+        Path(__file__).resolve().parents[1]
+        / "src/dcc_mcp_krita/skills/krita-document-authoring/SKILL.md"
+    )
+    text = skill.read_text(encoding="utf-8")
+    assert "## Installation lifecycle" in text
+    assert "dcc-mcp-krita verify" in text
+    assert "dcc-mcp-krita uninstall" in text
