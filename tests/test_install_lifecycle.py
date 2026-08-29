@@ -1031,7 +1031,12 @@ def test_unlink_keeps_validated_parent_handle_when_parent_swaps(
     original_unlink = installer._ReceiptParentHandle.unlink
     swapped = False
 
-    def swap_parent_after_validation(handle: object, name: str) -> None:
+    def swap_parent_after_validation(
+        handle: object,
+        name: str,
+        expected_identity: object = None,
+        expected_digest: object = None,
+    ) -> None:
         nonlocal swapped
         if name == "runtime.py" and not swapped:
             swapped = True
@@ -1052,7 +1057,7 @@ def test_unlink_keeps_validated_parent_handle_when_parent_swaps(
                     module.symlink_to(outside, target_is_directory=True)
             except OSError:
                 pytest.skip("parent link creation is unavailable on this runner")
-        original_unlink(handle, name)
+        original_unlink(handle, name, expected_identity, expected_digest)
 
     monkeypatch.setattr(installer._ReceiptParentHandle, "unlink", swap_parent_after_validation)
     receipt = json.loads(

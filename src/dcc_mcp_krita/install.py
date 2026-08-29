@@ -237,7 +237,7 @@ def _sha256(path: Path) -> str:
 
 
 def _receipt_path(destination: Path) -> Path:
-    return destination / _RECEIPT_RELATIVE
+    return _safe_receipt_path(destination, _RECEIPT_RELATIVE.as_posix(), "receipt")
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
@@ -441,7 +441,16 @@ class _ReceiptParentHandle:
             if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
                 raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt parent changed")
 
-    def unlink(self, name: str) -> None:
+    def unlink(
+        self,
+        name: str,
+        expected_identity: Optional[tuple[int, int, int, int]] = None,
+        expected_digest: Optional[str] = None,
+    ) -> None:
+        if expected_identity is not None and self.child_identity(name) != expected_identity:
+            raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path changed")
+        if expected_digest is not None and self.digest(name) != expected_digest:
+            raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path changed")
         if self.fd is not None:
             os.unlink(name, dir_fd=self.fd)
         else:
@@ -661,7 +670,11 @@ def _remove_receipt_owned_files(destination: Path, managed_files: list[Mapping[s
             parent_handle.revalidate()
             if parent_handle.child_identity(path.name) != before_identity:
                 raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path changed")
-            parent_handle.unlink(path.name)
+            parent_handle.unlink(
+                path.name,
+                expected_identity=before_identity,
+                expected_digest=expected_digest,
+            )
     module = destination / _PLUGIN_NAME
     if module.is_dir():
         # Receipt entries own files, not directory containers.  Prune only
