@@ -1092,18 +1092,22 @@ def test_uninstall_rejects_stable_replacement_after_identity_check(
     runtime = destination / "dcc_mcp_krita" / "runtime.py"
     replacement = b"operator replacement\n"
     original_identity = installer._receipt_file_identity(runtime, "managed file")
-    original_revalidate = installer._ReceiptParentHandle.revalidate
+    original_digest = installer._ReceiptParentHandle.digest
     swapped = False
 
-    def replace_after_identity(handle: object) -> None:
+    def replace_after_identity(handle: object, name: str) -> str:
         nonlocal swapped
-        original_revalidate(handle)
-        if Path(handle.path).resolve() == runtime.parent.resolve() and not swapped:
+        if (
+            name == runtime.name
+            and Path(handle.path).resolve() == runtime.parent.resolve()
+            and not swapped
+        ):
             swapped = True
             runtime.unlink()
             runtime.write_bytes(replacement)
+        return original_digest(handle, name)
 
-    monkeypatch.setattr(installer._ReceiptParentHandle, "revalidate", replace_after_identity)
+    monkeypatch.setattr(installer._ReceiptParentHandle, "digest", replace_after_identity)
     result = run_lifecycle(request.with_operation("uninstall"))
 
     assert swapped
