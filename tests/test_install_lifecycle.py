@@ -1066,6 +1066,53 @@ def test_unlink_keeps_validated_parent_handle_when_parent_swaps(
     assert victim.exists()
 
 
+def test_uninstall_rejects_stable_replacement_after_identity_check(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import dcc_mcp_krita.install as installer
+    from dcc_mcp_krita.install import LifecycleRequest, run_lifecycle
+
+    class Probe:
+        returncode = 0
+        stdout = "Krita 5.2.11\n"
+
+    monkeypatch.setattr(installer.subprocess, "run", lambda *args, **kwargs: Probe())
+    destination = tmp_path / "krita" / "pykrita"
+    dcc_path = tmp_path / "Host" / "krita.exe"
+    dcc_path.parent.mkdir()
+    dcc_path.touch()
+    request = LifecycleRequest(
+        operation="install",
+        dcc_path=dcc_path,
+        python_path=Path(sys.executable),
+        destination=destination,
+        yes=True,
+    )
+    assert run_lifecycle(request)["exit_code"] == 0
+    runtime = destination / "dcc_mcp_krita" / "runtime.py"
+    replacement = b"operator replacement\n"
+    original_identity = installer._receipt_file_identity(runtime, "managed file")
+    original_revalidate = installer._ReceiptParentHandle.revalidate
+    swapped = False
+
+    def replace_after_identity(handle: object) -> None:
+        nonlocal swapped
+        original_revalidate(handle)
+        if Path(handle.path).resolve() == runtime.parent.resolve() and not swapped:
+            swapped = True
+            runtime.unlink()
+            runtime.write_bytes(replacement)
+
+    monkeypatch.setattr(installer._ReceiptParentHandle, "revalidate", replace_after_identity)
+    result = run_lifecycle(request.with_operation("uninstall"))
+
+    assert swapped
+    assert result["exit_code"] == 10
+    assert result["stage"] == "receipt"
+    assert installer._receipt_file_identity(runtime, "managed file") != original_identity
+    assert runtime.read_bytes() == replacement
+
+
 def test_reparse_point_attribute_is_rejected_without_is_junction(
     tmp_path: Path, monkeypatch
 ) -> None:

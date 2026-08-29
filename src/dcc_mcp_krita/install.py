@@ -446,6 +446,31 @@ class _ReceiptParentHandle:
         else:
             os.unlink(str(self.physical_path / name))
 
+    def digest(self, name: str) -> str:
+        """Hash a child opened relative to this validated parent handle."""
+        # Windows CRT descriptors default to text mode and normalize CRLF,
+        # which would make receipt hashes differ from the bytes on disk.
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+        if self.fd is not None:
+            descriptor = os.open(name, flags, dir_fd=self.fd)
+        else:
+            descriptor = os.open(str(self.physical_path / name), flags)
+        try:
+            attributes = os.fstat(descriptor)
+            if _is_reparse_point(Path(name), attributes) or not stat.S_ISREG(attributes.st_mode):
+                raise LifecycleFailure(
+                    EXIT_PREFLIGHT, "receipt", "Receipt-owned path is not a regular file"
+                )
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            return digest.hexdigest()
+        finally:
+            os.close(descriptor)
+
     def close(self) -> None:
         if self.fd is not None:
             os.close(self.fd)
@@ -562,6 +587,9 @@ def _remove_plugin_files(destination: Path) -> None:
 def _remove_receipt_owned_files(destination: Path, managed_files: list[Mapping[str, Any]]) -> None:
     """Remove only paths explicitly owned by a validated install receipt."""
     root = Path(os.path.abspath(str(destination)))
+    validated: list[tuple[Path, str]] = []
+    # Validate every receipt entry before mutating any of them. This keeps a
+    # race on a later entry from causing an earlier entry to be removed.
     for record in managed_files:
         path = _safe_receipt_path(destination, record.get("path"), "managed file")
         if not os.path.lexists(str(path)):
@@ -574,8 +602,28 @@ def _remove_receipt_owned_files(destination: Path, managed_files: list[Mapping[s
             parent_after = _receipt_parent_identities(root, path, "managed file")
             after = _receipt_file_identity(path, "managed file")
             parent_handle.revalidate()
-            if before != after or parent_before != parent_after:
+            content_digest = parent_handle.digest(path.name)
+            content_identity = _receipt_file_identity(path, "managed file")
+            parent_handle.revalidate()
+            if (
+                before != after
+                or parent_before != parent_after
+                or content_identity != after
+                or content_digest != str(record.get("sha256", ""))
+            ):
                 raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path changed")
+        validated.append((path, str(record.get("sha256", ""))))
+
+    # Reacquire each validated parent and perform the final no-follow content
+    # check immediately before unlinking through that parent handle.
+    for path, expected_digest in validated:
+        if not os.path.lexists(str(path)):
+            raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path is missing")
+        with _ReceiptParentHandle(path.parent) as parent_handle:
+            parent_handle.revalidate()
+            if parent_handle.digest(path.name) != expected_digest:
+                raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path changed")
+            parent_handle.revalidate()
             parent_handle.unlink(path.name)
     module = destination / _PLUGIN_NAME
     if module.is_dir():
@@ -1059,8 +1107,12 @@ def run_lifecycle(request: LifecycleRequest) -> dict[str, Any]:
                 receipt.get("managed_files", []),
             )
             _receipt_path(destination).unlink()
-        except BaseException:
-            _restore_backup(destination, rollback)
+        except BaseException as exc:
+            # Receipt validation failures are fail-closed: do not recursively
+            # delete the plug-in tree while rolling back, because that could
+            # remove an operator-owned replacement discovered in the race.
+            if not (isinstance(exc, LifecycleFailure) and exc.stage == "receipt"):
+                _restore_backup(destination, rollback)
             _atomic_write(_receipt_path(destination), prior_receipt)
             _remove_backup(destination, rollback)
             raise
