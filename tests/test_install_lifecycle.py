@@ -837,3 +837,75 @@ def test_skill_guidance_exposes_lifecycle_entrypoint() -> None:
     assert "## Installation lifecycle" in text
     assert "dcc-mcp-krita verify" in text
     assert "dcc-mcp-krita uninstall" in text
+
+
+def test_uninstall_preserves_unowned_files_inside_plugin_directory(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import dcc_mcp_krita.install as installer
+    from dcc_mcp_krita.install import LifecycleRequest, run_lifecycle
+
+    class Probe:
+        returncode = 0
+        stdout = "Krita 5.2.11\n"
+
+    monkeypatch.setattr(installer.subprocess, "run", lambda *args, **kwargs: Probe())
+    destination = tmp_path / "krita" / "pykrita"
+    dcc_path = tmp_path / "Host" / "krita.exe"
+    dcc_path.parent.mkdir()
+    dcc_path.touch()
+    request = LifecycleRequest(
+        operation="install",
+        dcc_path=dcc_path,
+        python_path=Path(sys.executable),
+        destination=destination,
+        yes=True,
+    )
+    assert run_lifecycle(request)["exit_code"] == 0
+    operator_file = destination / "dcc_mcp_krita" / "operator.txt"
+    operator_file.write_text("operator-owned", encoding="utf-8")
+
+    result = run_lifecycle(request.with_operation("uninstall"))
+
+    assert result["exit_code"] == 0
+    assert operator_file.read_text(encoding="utf-8") == "operator-owned"
+
+
+def test_core_restart_result_keeps_requires_restart_exit_code(tmp_path: Path, monkeypatch) -> None:
+    import dcc_mcp_core.install_lifecycle as core_lifecycle
+
+    import dcc_mcp_krita.install as installer
+    from dcc_mcp_krita.install import LifecycleRequest, run_lifecycle
+
+    class Probe:
+        returncode = 0
+        stdout = "Krita 5.2.11\n"
+
+    monkeypatch.setattr(installer.subprocess, "run", lambda *args, **kwargs: Probe())
+    monkeypatch.setattr(
+        core_lifecycle,
+        "safe_replace_tree",
+        lambda *_args, **_kwargs: {
+            "success": False,
+            "status": "requires_restart",
+            "requires_restart": True,
+            "message": "Krita has the plug-in loaded",
+        },
+    )
+    destination = tmp_path / "krita" / "pykrita"
+    dcc_path = tmp_path / "Host" / "krita.exe"
+    dcc_path.parent.mkdir()
+    dcc_path.touch()
+    request = LifecycleRequest(
+        operation="install",
+        dcc_path=dcc_path,
+        python_path=Path(sys.executable),
+        destination=destination,
+        yes=True,
+    )
+
+    result = run_lifecycle(request)
+
+    assert result["exit_code"] == 50
+    assert result["stage"] == "locked_files"
+    assert result["status"] == "failed"

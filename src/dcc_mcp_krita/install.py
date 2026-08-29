@@ -125,6 +125,16 @@ def _core_safe_replace_tree(source: Path, destination: Path) -> None:
         return
     result = safe_replace_tree(source, destination)
     if not isinstance(result, Mapping) or not result.get("success"):
+        if isinstance(result, Mapping) and (
+            result.get("requires_restart") or result.get("status") == "requires_restart"
+        ):
+            raise LifecycleFailure(
+                EXIT_REQUIRES_RESTART,
+                "locked_files",
+                str(
+                    result.get("message") or "Krita plug-in files are loaded; close Krita and retry"
+                ),
+            )
         reason = "Core could not stage the Krita plug-in tree"
         if isinstance(result, Mapping) and result.get("message"):
             reason = str(result["message"])
@@ -361,8 +371,43 @@ def _remove_plugin_files(destination: Path) -> None:
         shutil.rmtree(module)
 
 
-def _restore_backup(destination: Path, backup: Mapping[str, Any]) -> None:
-    _remove_plugin_files(destination)
+def _remove_receipt_owned_files(destination: Path, managed_files: list[Mapping[str, Any]]) -> None:
+    """Remove only paths explicitly owned by a validated install receipt."""
+    for record in managed_files:
+        path = _safe_receipt_path(destination, record.get("path"), "managed file")
+        if path.exists() and not path.is_file():
+            raise LifecycleFailure(
+                EXIT_PREFLIGHT, "receipt", "Receipt-owned path is not a regular file"
+            )
+        path.unlink(missing_ok=True)
+    module = destination / _PLUGIN_NAME
+    if module.is_dir():
+        # Receipt entries own files, not directory containers.  Prune only
+        # containers left empty by those removals, preserving operator files.
+        for directory in sorted(
+            (path for path in module.rglob("*") if path.is_dir()),
+            key=lambda path: len(path.parts),
+            reverse=True,
+        ):
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+        try:
+            module.rmdir()
+        except OSError:
+            pass
+
+
+def _restore_backup(
+    destination: Path,
+    backup: Mapping[str, Any],
+    managed_files: Optional[list[Mapping[str, Any]]] = None,
+) -> None:
+    if managed_files is None:
+        _remove_plugin_files(destination)
+    else:
+        _remove_receipt_owned_files(destination, managed_files)
     backup_root = destination / str(backup.get("root", ""))
     if backup.get("desktop"):
         shutil.copy2(
@@ -811,7 +856,11 @@ def run_lifecycle(request: LifecycleRequest) -> dict[str, Any]:
         rollback = _backup_existing(destination)
         prior_receipt = _receipt_path(destination).read_bytes()
         try:
-            _restore_backup(destination, receipt.get("backup", {}))
+            _restore_backup(
+                destination,
+                receipt.get("backup", {}),
+                receipt.get("managed_files", []),
+            )
             _receipt_path(destination).unlink()
         except BaseException:
             _restore_backup(destination, rollback)
