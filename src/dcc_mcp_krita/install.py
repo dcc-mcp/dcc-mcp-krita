@@ -461,14 +461,61 @@ class _ReceiptParentHandle:
         expected_identity: Optional[tuple[int, int, int, int]] = None,
         expected_digest: Optional[str] = None,
     ) -> None:
-        if expected_identity is not None and self._child_identity(name) != expected_identity:
-            raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path changed")
-        if expected_digest is not None and self._digest(name) != expected_digest:
-            raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path changed")
+        # Move the pathname into a private quarantine slot first.  Rename is
+        # atomic within the held parent directory, so a replacement that wins
+        # the race is what gets sampled below; it can never be deleted through
+        # the original operator-visible name.
+        quarantine = ".%s.dcc-mcp-unlink-%s" % (name, uuid.uuid4().hex)
+        self._rename(name, quarantine)
+        keep_quarantine = True
+        try:
+            actual_identity = self._child_identity(quarantine)
+            actual_digest = self._digest(quarantine)
+            if (expected_identity is not None and actual_identity != expected_identity) or (
+                expected_digest is not None and actual_digest != expected_digest
+            ):
+                raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path changed")
+            self._unlink_name(quarantine)
+            keep_quarantine = False
+        finally:
+            if keep_quarantine:
+                self._restore_quarantine(quarantine, name)
+
+    def _rename(self, source: str, target: str) -> None:
+        if self.fd is not None:
+            os.rename(source, target, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+        else:
+            os.rename(str(self.physical_path / source), str(self.physical_path / target))
+
+    def _unlink_name(self, name: str) -> None:
         if self.fd is not None:
             os.unlink(name, dir_fd=self.fd)
         else:
             os.unlink(str(self.physical_path / name))
+
+    def _restore_quarantine(self, quarantine: str, name: str) -> None:
+        """Restore a failed quarantine without overwriting a race winner."""
+        try:
+            if self.fd is not None:
+                os.link(
+                    quarantine,
+                    name,
+                    src_dir_fd=self.fd,
+                    dst_dir_fd=self.fd,
+                    follow_symlinks=False,
+                )
+                os.unlink(quarantine, dir_fd=self.fd)
+            else:
+                os.link(
+                    str(self.physical_path / quarantine),
+                    str(self.physical_path / name),
+                    follow_symlinks=False,
+                )
+                os.unlink(str(self.physical_path / quarantine))
+        except OSError:
+            # If the operator has already recreated ``name`` or the platform
+            # cannot hard-link this object, leave the quarantine untouched.
+            return
 
     def _digest(self, name: str) -> str:
         """Hash a child opened relative to this validated parent handle."""
