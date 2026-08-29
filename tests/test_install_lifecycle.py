@@ -1144,6 +1144,12 @@ def test_uninstall_rejects_parent_swap_between_validation_and_unlink(
     module = destination / "dcc_mcp_krita"
     attacker = tmp_path / "attacker"
     shutil.copytree(module, attacker)
+    receipt = json.loads(
+        (destination / ".dcc-mcp" / "receipts" / "krita.json").read_text(encoding="utf-8")
+    )
+    expected_parent_handles = len(
+        {Path(record["path"]).parent for record in receipt["managed_files"]}
+    )
     original_init = installer._ReceiptParentHandle.__init__
     parent_handles = 0
 
@@ -1161,7 +1167,7 @@ def test_uninstall_rejects_parent_swap_between_validation_and_unlink(
     result = run_lifecycle(request.with_operation("uninstall"))
 
     assert result["exit_code"] == 0
-    assert parent_handles == 3
+    assert parent_handles == expected_parent_handles
     assert not module.exists()
     assert (attacker / "runtime.py").is_file()
 
