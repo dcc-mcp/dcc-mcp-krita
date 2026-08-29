@@ -999,6 +999,73 @@ def test_uninstall_fails_closed_when_managed_path_swaps_during_reacquisition(
     assert operator_file.exists()
 
 
+def test_unlink_keeps_validated_parent_handle_when_parent_swaps(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import dcc_mcp_krita.install as installer
+    from dcc_mcp_krita.install import LifecycleRequest, run_lifecycle
+
+    class Probe:
+        returncode = 0
+        stdout = "Krita 5.2.11\n"
+
+    monkeypatch.setattr(installer.subprocess, "run", lambda *args, **kwargs: Probe())
+    destination = tmp_path / "krita" / "pykrita"
+    dcc_path = tmp_path / "Host" / "krita.exe"
+    dcc_path.parent.mkdir()
+    dcc_path.touch()
+    request = LifecycleRequest(
+        operation="install",
+        dcc_path=dcc_path,
+        python_path=Path(sys.executable),
+        destination=destination,
+        yes=True,
+    )
+    assert run_lifecycle(request)["exit_code"] == 0
+    module = destination / "dcc_mcp_krita"
+    outside = tmp_path / "operator"
+    outside.mkdir()
+    victim = outside / "runtime.py"
+    victim.write_bytes((module / "runtime.py").read_bytes())
+    original_unlink = installer._ReceiptParentHandle.unlink
+    swapped = False
+
+    def swap_parent_after_validation(handle: object, name: str) -> None:
+        nonlocal swapped
+        if name == "runtime.py" and not swapped:
+            swapped = True
+            renamed = module.with_name("dcc_mcp_krita-renamed")
+            module.rename(renamed)
+            try:
+                if os.name == "nt":
+                    import subprocess
+
+                    result = subprocess.run(
+                        ["cmd.exe", "/c", "mklink", "/J", str(module), str(outside)],
+                        check=False,
+                        capture_output=True,
+                    )
+                    if result.returncode != 0:
+                        pytest.skip("junction creation is unavailable on this runner")
+                else:
+                    module.symlink_to(outside, target_is_directory=True)
+            except OSError:
+                pytest.skip("parent link creation is unavailable on this runner")
+        original_unlink(handle, name)
+
+    monkeypatch.setattr(installer._ReceiptParentHandle, "unlink", swap_parent_after_validation)
+    receipt = json.loads(
+        (destination / ".dcc-mcp" / "receipts" / "krita.json").read_text(encoding="utf-8")
+    )
+    try:
+        installer._remove_receipt_owned_files(destination, receipt["managed_files"])
+    except (OSError, installer.LifecycleFailure):
+        pass
+
+    assert swapped
+    assert victim.exists()
+
+
 def test_reparse_point_attribute_is_rejected_without_is_junction(
     tmp_path: Path, monkeypatch
 ) -> None:

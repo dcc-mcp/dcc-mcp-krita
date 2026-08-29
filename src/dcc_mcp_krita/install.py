@@ -379,16 +379,98 @@ def _receipt_parent_identities(
     return tuple(identities)
 
 
-def _unlink_receipt_file(path: Path) -> None:
-    """Unlink a receipt file without following its final path component."""
-    if os.unlink in getattr(os, "supports_dir_fd", set()):
-        descriptor = os.open(str(path.parent), os.O_RDONLY)
-        try:
-            os.unlink(path.name, dir_fd=descriptor)
-        finally:
-            os.close(descriptor)
-    else:
-        os.unlink(str(path))
+class _ReceiptParentHandle:
+    """Hold a validated parent directory for no-follow receipt deletion."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.fd: Optional[int] = None
+        self.handle: Any = None
+        self.physical_path = path
+        if os.name == "nt":
+            self._open_windows()
+        elif os.unlink in getattr(os, "supports_dir_fd", set()):
+            self.fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+
+    def _open_windows(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        create_file = ctypes.windll.kernel32.CreateFileW
+        create_file.restype = wintypes.HANDLE
+        self.handle = create_file(
+            str(self.path),
+            0x0001,  # FILE_LIST_DIRECTORY
+            0x00000001 | 0x00000002 | 0x00000004,  # share read/write/delete
+            None,
+            3,  # OPEN_EXISTING
+            0x02000000 | 0x00200000,  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+            None,
+        )
+        if self.handle in (None, wintypes.HANDLE(-1).value):
+            raise OSError("Could not open receipt parent directory handle")
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = ctypes.windll.kernel32.GetFinalPathNameByHandleW(
+            self.handle, buffer, len(buffer), 0
+        )
+        if not length or length >= len(buffer):
+            self.close()
+            raise OSError("Could not resolve receipt parent directory handle")
+        self.physical_path = Path(buffer.value)
+
+    def identity(self) -> tuple[str, str]:
+        if self.fd is not None:
+            attributes = os.fstat(self.fd)
+            return (str(attributes.st_dev), str(attributes.st_ino))
+        if os.name == "nt":
+            return (os.path.normcase(str(self.physical_path)), "handle")
+        attributes = os.lstat(str(self.path))
+        return (str(attributes.st_dev), str(attributes.st_ino))
+
+    def revalidate(self) -> None:
+        _assert_no_reparse_components(self.path.parent, self.path, "managed file")
+        if os.name == "nt":
+            current = _windows_path_key(self.path)
+            opened = _windows_path_key(self.physical_path)
+            if current != opened:
+                raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt parent changed")
+        elif self.fd is not None:
+            current = os.lstat(str(self.path))
+            opened = os.fstat(self.fd)
+            if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+                raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt parent changed")
+
+    def unlink(self, name: str) -> None:
+        if self.fd is not None:
+            os.unlink(name, dir_fd=self.fd)
+        else:
+            os.unlink(str(self.physical_path / name))
+
+    def close(self) -> None:
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+        if self.handle not in (None, 0):
+            import ctypes
+
+            ctypes.windll.kernel32.CloseHandle(self.handle)
+            self.handle = None
+
+    def __enter__(self) -> "_ReceiptParentHandle":
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        self.close()
+
+
+def _windows_path_key(path: Path) -> str:
+    """Normalize ordinary and extended-prefix Windows paths for comparison."""
+    value = os.path.normcase(os.path.realpath(str(path)))
+    if value.startswith("\\\\?\\UNC\\"):
+        value = "\\\\" + value[8:]
+    elif value.startswith("\\\\?\\"):
+        value = value[4:]
+    return value.rstrip("\\/")
 
 
 def _validate_receipt(destination: Path, receipt: Mapping[str, Any]) -> None:
@@ -484,16 +566,17 @@ def _remove_receipt_owned_files(destination: Path, managed_files: list[Mapping[s
         path = _safe_receipt_path(destination, record.get("path"), "managed file")
         if not os.path.lexists(str(path)):
             raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path is missing")
-        parent_before = _receipt_parent_identities(root, path, "managed file")
-        before = _receipt_file_identity(path, "managed file")
-        # Re-check the no-follow physical identity immediately before unlink;
-        # a replacement with a symlink or another inode fails closed.
-        parent_after = _receipt_parent_identities(root, path, "managed file")
-        after = _receipt_file_identity(path, "managed file")
-        if before != after or parent_before != parent_after:
-            raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path changed")
-        _assert_no_reparse_components(root, path, "managed file")
-        _unlink_receipt_file(path)
+        with _ReceiptParentHandle(path.parent) as parent_handle:
+            parent_before = _receipt_parent_identities(root, path, "managed file")
+            before = _receipt_file_identity(path, "managed file")
+            # Re-check the no-follow physical identity immediately before
+            # unlink; a replacement with a symlink or another inode fails closed.
+            parent_after = _receipt_parent_identities(root, path, "managed file")
+            after = _receipt_file_identity(path, "managed file")
+            parent_handle.revalidate()
+            if before != after or parent_before != parent_after:
+                raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path changed")
+            parent_handle.unlink(path.name)
     module = destination / _PLUGIN_NAME
     if module.is_dir():
         # Receipt entries own files, not directory containers.  Prune only
