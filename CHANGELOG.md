@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/dcc-mcp/dcc-mcp-krita/compare/v0.4.0...v0.5.0) (2026-08-30)
+
+
+### Features
+
+* align Krita install staging and skill guidance ([#9](https://github.com/dcc-mcp/dcc-mcp-krita/issues/9)) ([5bd6fc6](https://github.com/dcc-mcp/dcc-mcp-krita/commit/5bd6fc6665e396f696ff6f2c6d3115b263762f67))
+
 ## [0.4.0](https://github.com/dcc-mcp/dcc-mcp-krita/compare/v0.3.0...v0.4.0) (2026-08-25)
 
 
