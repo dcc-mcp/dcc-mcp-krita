@@ -24,6 +24,8 @@ from typing import Any, Mapping, Optional
 
 from .__version__ import __version__
 
+_NOFOLLOW_UNLINK = os.unlink
+
 _PLUGIN_NAME = "dcc_mcp_krita"
 _ADAPTER_VERSION = __version__
 _SCHEMA_VERSION = "1.0"
@@ -402,6 +404,8 @@ class _ReceiptParentHandle:
         self.fd: Optional[int] = None
         self.handle: Any = None
         self.physical_path = path
+        # Reject symlink/junction parents before opening any platform handle.
+        _assert_no_reparse_components(self.path.parent, self.path, "managed file")
         if os.name == "nt":
             self._open_windows()
         elif os.unlink in getattr(os, "supports_dir_fd", set()):
@@ -518,9 +522,9 @@ class _ReceiptParentHandle:
             # Keep the final unlink in this primitive; calling an overridable
             # helper here would reopen a replacement seam after sampling.
             if self.fd is not None:
-                os.unlink(quarantine, dir_fd=self.fd)
+                _NOFOLLOW_UNLINK(quarantine, dir_fd=self.fd)
             else:
-                os.unlink(str(self.physical_path / quarantine))
+                _NOFOLLOW_UNLINK(str(self.physical_path / quarantine))
             keep_quarantine = False
         finally:
             if keep_quarantine:
