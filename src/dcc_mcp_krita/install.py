@@ -870,6 +870,23 @@ def _restore_backup(
         shutil.copytree(backup_root / _PLUGIN_NAME, destination / _PLUGIN_NAME)
 
 
+def _restore_receipt_owned_from_backup(
+    destination: Path,
+    backup: Mapping[str, Any],
+    managed_files: list[Mapping[str, Any]],
+) -> None:
+    """Restore only missing receipt-owned files after a failed uninstall."""
+    backup_root = _safe_receipt_path(destination, backup.get("root"), "backup root")
+    for record in managed_files:
+        relative = record.get("path")
+        source = _safe_receipt_path(backup_root, relative, "backup file")
+        target = _safe_receipt_path(destination, relative, "managed file")
+        if target.exists() or not source.is_file():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+
+
 def _remove_backup(destination: Path, backup: Mapping[str, Any]) -> None:
     backup_root = destination / str(backup.get("root", ""))
     if backup_root.is_dir():
@@ -1332,7 +1349,13 @@ def run_lifecycle(request: LifecycleRequest) -> dict[str, Any]:
             # Receipt validation failures are fail-closed: do not recursively
             # delete the plug-in tree while rolling back, because that could
             # remove an operator-owned replacement discovered in the race.
-            if not (isinstance(exc, LifecycleFailure) and exc.stage == "receipt"):
+            if isinstance(exc, LifecycleFailure) and exc.stage == "receipt":
+                _restore_receipt_owned_from_backup(
+                    destination,
+                    rollback,
+                    receipt.get("managed_files", []),
+                )
+            else:
                 _restore_backup(destination, rollback)
             _safe_restore_receipt(destination, prior_receipt)
             _remove_backup(destination, rollback)

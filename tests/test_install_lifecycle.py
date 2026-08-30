@@ -392,6 +392,45 @@ def test_uninstall_returns_structured_failure_for_replaced_receipt_container(
     assert not (external / "krita.json").exists()
 
 
+def test_uninstall_restores_managed_files_when_receipt_delete_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import dcc_mcp_krita.install as installer
+    from dcc_mcp_krita.install import LifecycleRequest, run_lifecycle
+
+    class Probe:
+        returncode = 0
+        stdout = "Krita 5.2.11\n"
+
+    monkeypatch.setattr(installer.subprocess, "run", lambda *args, **kwargs: Probe())
+    destination = tmp_path / "krita" / "pykrita"
+    dcc_path = tmp_path / "Host" / "krita.exe"
+    dcc_path.parent.mkdir()
+    dcc_path.touch()
+    request = LifecycleRequest(
+        operation="install",
+        dcc_path=dcc_path,
+        python_path=Path(sys.executable),
+        destination=destination,
+        yes=True,
+    )
+    assert run_lifecycle(request)["exit_code"] == 0
+    original_unlink = installer._ReceiptParentHandle.unlink
+
+    def fail_receipt_delete(handle: object, name: str, *args: object, **kwargs: object) -> None:
+        if name == "krita.json":
+            raise installer.LifecycleFailure(10, "receipt", "simulated receipt race")
+        original_unlink(handle, name, *args, **kwargs)
+
+    monkeypatch.setattr(installer._ReceiptParentHandle, "unlink", fail_receipt_delete)
+    result = run_lifecycle(request.with_operation("uninstall"))
+
+    assert result["exit_code"] == 10
+    assert result["stage"] == "receipt"
+    assert (destination / "dcc_mcp_krita.desktop").is_file()
+    assert (destination / "dcc_mcp_krita" / "runtime.py").is_file()
+
+
 def test_uninstall_fails_closed_for_unreceipted_partial_install(
     tmp_path: Path, monkeypatch
 ) -> None:
