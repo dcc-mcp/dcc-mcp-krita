@@ -33,3 +33,24 @@ path, byte size, and SHA-256 before passing the artifact to another DCC.
 Flattening, deleting layers, discarding changes, and overwriting files require
 explicit typed opt-ins. The bridge never evaluates caller-provided Python,
 Krita scripts, shell commands, or free-form action identifiers.
+
+## Installation lifecycle
+
+Use the adapter lifecycle entry point before authoring when the Krita plug-in
+is not yet installed or its readiness is uncertain. Plans are read-only;
+mutations require `--yes` and should be followed by verification:
+
+```bash
+dcc-mcp-krita status --dcc-path /path/to/krita --json
+dcc-mcp-krita install --dcc-path /path/to/krita --yes --json
+dcc-mcp-krita verify --dcc-path /path/to/krita --json
+```
+
+The same entry point supports `upgrade` and receipt-owned `uninstall`. Keep
+Krita closed while files are replaced, and treat exit code `50` as a
+restart-required handoff. A successful install does not prove a licensed live
+Krita host is usable; only `verify` with an authenticated bridge can establish
+that boundary.
+
+For removal, use `dcc-mcp-krita uninstall --dcc-path /path/to/krita --yes --json`;
+it deletes only files recorded by the install receipt.

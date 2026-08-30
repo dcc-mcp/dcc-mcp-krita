@@ -9,10 +9,12 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import uuid
+from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError
@@ -21,6 +23,8 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from .__version__ import __version__
+
+_NOFOLLOW_UNLINK = os.unlink
 
 _PLUGIN_NAME = "dcc_mcp_krita"
 _ADAPTER_VERSION = __version__
@@ -116,6 +120,31 @@ def _validate_source(source: Path) -> None:
         raise FileNotFoundError("Bundled Krita plug-in is incomplete: %s" % ", ".join(missing))
 
 
+def _core_safe_replace_tree(source: Path, destination: Path) -> None:
+    """Stage a tree through Core's lock-aware lifecycle primitive."""
+    try:
+        from dcc_mcp_core.install_lifecycle import safe_replace_tree
+    except ImportError:
+        shutil.copytree(source, destination)
+        return
+    result = safe_replace_tree(source, destination)
+    if not isinstance(result, Mapping) or not result.get("success"):
+        if isinstance(result, Mapping) and (
+            result.get("requires_restart") or result.get("status") == "requires_restart"
+        ):
+            raise LifecycleFailure(
+                EXIT_REQUIRES_RESTART,
+                "locked_files",
+                str(
+                    result.get("message") or "Krita plug-in files are loaded; close Krita and retry"
+                ),
+            )
+        reason = "Core could not stage the Krita plug-in tree"
+        if isinstance(result, Mapping) and result.get("message"):
+            reason = str(result["message"])
+        raise OSError(reason)
+
+
 def install(destination: Optional[Path] = None) -> Path:
     """Atomically stage the desktop entry and Python package with rollback."""
     target = (destination or default_pykrita_dir()).expanduser().resolve()
@@ -134,7 +163,7 @@ def install(destination: Optional[Path] = None) -> Path:
         staged_desktop = staging / desktop_name
         staged_module = staging / _PLUGIN_NAME
         shutil.copy2(source / desktop_name, staged_desktop)
-        shutil.copytree(source / _PLUGIN_NAME, staged_module)
+        _core_safe_replace_tree(source / _PLUGIN_NAME, staged_module)
         if os.name != "nt":
             for python_file in staged_module.rglob("*.py"):
                 python_file.chmod(0o755)
@@ -210,7 +239,7 @@ def _sha256(path: Path) -> str:
 
 
 def _receipt_path(destination: Path) -> Path:
-    return destination / _RECEIPT_RELATIVE
+    return _safe_receipt_path(destination, _RECEIPT_RELATIVE.as_posix(), "receipt")
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
@@ -228,6 +257,20 @@ def _atomic_write(path: Path, data: bytes) -> None:
 
 def _write_json(path: Path, value: Mapping[str, Any]) -> None:
     _atomic_write(path, (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+
+
+def _safe_restore_receipt(destination: Path, prior_receipt: Optional[bytes]) -> None:
+    """Restore a receipt without allowing a replaced container to escape root."""
+    try:
+        path = _receipt_path(destination)
+        if prior_receipt is None:
+            path.unlink(missing_ok=True)
+        else:
+            _atomic_write(path, prior_receipt)
+    except (LifecycleFailure, OSError):
+        # The original lifecycle failure remains the source of truth.  Never
+        # turn recovery of an unsafe receipt container into an uncaught error.
+        return
 
 
 def _read_receipt(destination: Path) -> Optional[dict[str, Any]]:
@@ -251,15 +294,403 @@ def _read_receipt(destination: Path) -> Optional[dict[str, Any]]:
 def _safe_receipt_path(destination: Path, value: object, label: str) -> Path:
     if not isinstance(value, str) or not value or Path(value).is_absolute():
         raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt %s is unsafe" % label)
-    root = destination.resolve()
-    path = (destination / value).resolve()
+    # Normalize lexically without resolving symlinks.  Resolving here would
+    # turn a receipt path into an operator-owned target before deletion.
+    root = Path(os.path.abspath(str(destination)))
+    path = Path(os.path.abspath(os.path.join(str(destination), value)))
     try:
-        inside = os.path.commonpath((str(root), str(path))) == str(root)
+        inside = os.path.normcase(os.path.commonpath((str(root), str(path)))) == os.path.normcase(
+            str(root)
+        )
     except ValueError:
         inside = False
     if not inside:
         raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt %s escapes pykrita" % label)
+    _assert_no_reparse_components(root, path, label)
     return path
+
+
+def _assert_no_reparse_components(root: Path, path: Path, label: str) -> None:
+    """Reject symlink/junction components without following them."""
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise LifecycleFailure(
+            EXIT_PREFLIGHT, "receipt", "Receipt %s escapes pykrita" % label
+        ) from exc
+    current = root
+    for component in relative.parts:
+        current = current / component
+        if not os.path.lexists(str(current)):
+            continue
+        try:
+            attributes = os.lstat(str(current))
+        except OSError as exc:
+            raise LifecycleFailure(
+                EXIT_PREFLIGHT, "receipt", "Receipt %s cannot be inspected" % label
+            ) from exc
+        if _is_reparse_point(current, attributes):
+            raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt %s contains a link" % label)
+
+
+def _is_reparse_point(path: Path, attributes: Any) -> bool:
+    """Detect symlinks and Windows reparse points on Python 3.9+."""
+    if stat.S_ISLNK(attributes.st_mode):
+        return True
+    # Path.is_junction() was added in Python 3.12. Older Windows Python
+    # exposes FILE_ATTRIBUTE_REPARSE_POINT through st_file_attributes.
+    if int(getattr(attributes, "st_file_attributes", 0)) & 0x0400:
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if is_junction is None:
+        return False
+    try:
+        return bool(is_junction())
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def _receipt_file_identity(path: Path, label: str) -> tuple[int, int, int, int]:
+    """Return a no-follow identity for an owned regular file."""
+    try:
+        attributes = os.lstat(str(path))
+    except OSError as exc:
+        raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt %s changed" % label) from exc
+    if _is_reparse_point(path, attributes):
+        raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt %s contains a link" % label)
+    if not stat.S_ISREG(attributes.st_mode):
+        raise LifecycleFailure(
+            EXIT_PREFLIGHT, "receipt", "Receipt-owned path is not a regular file"
+        )
+    return (
+        int(attributes.st_dev),
+        int(attributes.st_ino),
+        int(attributes.st_size),
+        int(getattr(attributes, "st_mtime_ns", int(attributes.st_mtime * 1_000_000_000))),
+    )
+
+
+def _receipt_parent_identities(
+    root: Path, path: Path, label: str
+) -> tuple[tuple[str, tuple[int, int]], ...]:
+    """Capture no-follow identities for every directory leading to a receipt file."""
+    relative = path.relative_to(root)
+    current = root
+    identities: list[tuple[str, tuple[int, int]]] = []
+    for component in relative.parts[:-1]:
+        current = current / component
+        try:
+            attributes = os.lstat(str(current))
+        except OSError as exc:
+            raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt %s changed" % label) from exc
+        if _is_reparse_point(current, attributes):
+            raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt %s contains a link" % label)
+        if not stat.S_ISDIR(attributes.st_mode):
+            raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt parent is not a directory")
+        identities.append(
+            (
+                component,
+                (int(attributes.st_dev), int(attributes.st_ino)),
+            )
+        )
+    return tuple(identities)
+
+
+class _ReceiptParentHandle:
+    """Hold a validated parent directory for no-follow receipt deletion."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.fd: Optional[int] = None
+        self.handle: Any = None
+        self.physical_path = path
+        self.windows_file_id: Optional[tuple[int, int, int]] = None
+        # Reject symlink/junction parents before opening any platform handle.
+        _assert_no_reparse_components(self.path.parent, self.path, "managed file")
+        if os.name == "nt":
+            self._open_windows()
+        elif os.unlink in getattr(os, "supports_dir_fd", set()):
+            self.fd = os.open(
+                str(path),
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            )
+
+    def _open_windows(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        create_file = ctypes.windll.kernel32.CreateFileW
+        create_file.restype = wintypes.HANDLE
+        self.handle = create_file(
+            str(self.path),
+            0x0001,  # FILE_LIST_DIRECTORY
+            0x00000001 | 0x00000002,  # share read/write; deny parent delete/rename
+            None,
+            3,  # OPEN_EXISTING
+            0x02000000 | 0x00200000,  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+            None,
+        )
+        if self.handle in (None, wintypes.HANDLE(-1).value):
+            raise OSError("Could not open receipt parent directory handle")
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = ctypes.windll.kernel32.GetFinalPathNameByHandleW(
+            self.handle, buffer, len(buffer), 0
+        )
+        if not length or length >= len(buffer):
+            self.close()
+            raise OSError("Could not resolve receipt parent directory handle")
+        self.physical_path = Path(buffer.value)
+        self.windows_file_id = self._windows_handle_identity(self.handle)
+
+    @staticmethod
+    def _windows_handle_identity(handle: Any) -> tuple[int, int, int]:
+        import ctypes
+        from ctypes import wintypes
+
+        class FileInfo(ctypes.Structure):
+            _fields_ = [
+                ("attributes", wintypes.DWORD),
+                ("created", wintypes.FILETIME),
+                ("accessed", wintypes.FILETIME),
+                ("written", wintypes.FILETIME),
+                ("volume", wintypes.DWORD),
+                ("size_high", wintypes.DWORD),
+                ("size_low", wintypes.DWORD),
+                ("links", wintypes.DWORD),
+                ("index_high", wintypes.DWORD),
+                ("index_low", wintypes.DWORD),
+            ]
+
+        info = FileInfo()
+        if not ctypes.windll.kernel32.GetFileInformationByHandle(handle, ctypes.byref(info)):
+            raise ctypes.WinError()
+        return (int(info.volume), int(info.index_high), int(info.index_low))
+
+    def identity(self) -> tuple[str, str]:
+        if self.fd is not None:
+            attributes = os.fstat(self.fd)
+            return (str(attributes.st_dev), str(attributes.st_ino))
+        if os.name == "nt":
+            return (os.path.normcase(str(self.physical_path)), "handle")
+        attributes = os.lstat(str(self.path))
+        return (str(attributes.st_dev), str(attributes.st_ino))
+
+    def revalidate(self) -> None:
+        _assert_no_reparse_components(self.path.parent, self.path, "managed file")
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            create_file = ctypes.windll.kernel32.CreateFileW
+            create_file.restype = wintypes.HANDLE
+            current_handle = create_file(
+                str(self.path),
+                0x0001,  # FILE_LIST_DIRECTORY
+                0x00000001 | 0x00000002,
+                None,
+                3,
+                0x02000000 | 0x00200000,
+                None,
+            )
+            if current_handle in (None, wintypes.HANDLE(-1).value):
+                raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt parent changed")
+            try:
+                current_id = self._windows_handle_identity(current_handle)
+            finally:
+                ctypes.windll.kernel32.CloseHandle(current_handle)
+            if current_id != self.windows_file_id:
+                raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt parent changed")
+        elif self.fd is not None:
+            current = os.lstat(str(self.path))
+            opened = os.fstat(self.fd)
+            if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+                raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt parent changed")
+
+    def unlink(
+        self,
+        name: str,
+        expected_identity: Optional[tuple[int, int, int, int]] = None,
+        expected_digest: Optional[str] = None,
+    ) -> None:
+        # Move the pathname into a private quarantine slot first.  Rename is
+        # atomic within the held parent directory, so a replacement that wins
+        # the race is what gets sampled below; it can never be deleted through
+        # the original operator-visible name.
+        quarantine = ".%s.dcc-mcp-unlink-%s" % (name, uuid.uuid4().hex)
+        self._rename(name, quarantine)
+        keep_quarantine = True
+        try:
+
+            def sample() -> tuple[tuple[int, int, int, int], str]:
+                flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+                if self.fd is not None:
+                    descriptor = os.open(quarantine, flags, dir_fd=self.fd)
+                else:
+                    descriptor = os.open(str(self.physical_path / quarantine), flags)
+                try:
+                    attributes = os.fstat(descriptor)
+                    if _is_reparse_point(Path(quarantine), attributes) or not stat.S_ISREG(
+                        attributes.st_mode
+                    ):
+                        raise LifecycleFailure(
+                            EXIT_PREFLIGHT, "receipt", "Receipt-owned path is not a regular file"
+                        )
+                    digest = hashlib.sha256()
+                    while True:
+                        chunk = os.read(descriptor, 1024 * 1024)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                    identity = (
+                        int(attributes.st_dev),
+                        int(attributes.st_ino),
+                        int(attributes.st_size),
+                        int(
+                            getattr(
+                                attributes,
+                                "st_mtime_ns",
+                                int(attributes.st_mtime * 1_000_000_000),
+                            )
+                        ),
+                    )
+                    return identity, digest.hexdigest()
+                finally:
+                    os.close(descriptor)
+
+            actual_identity, actual_digest = sample()
+            if (expected_identity is not None and actual_identity != expected_identity) or (
+                expected_digest is not None and actual_digest != expected_digest
+            ):
+                raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path changed")
+            # Re-sample identity after content hashing. This closes the
+            # replacement seam between the final digest and quarantine unlink.
+            if sample()[0] != actual_identity:
+                raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path changed")
+            # Keep the final unlink in this primitive; calling an overridable
+            # helper here would reopen a replacement seam after sampling.
+            if self.fd is not None:
+                _NOFOLLOW_UNLINK(quarantine, dir_fd=self.fd)
+            else:
+                _NOFOLLOW_UNLINK(str(self.physical_path / quarantine))
+            keep_quarantine = False
+        finally:
+            if keep_quarantine:
+                self._restore_quarantine(quarantine, name)
+
+    def _rename(self, source: str, target: str) -> None:
+        if self.fd is not None:
+            os.rename(source, target, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+        else:
+            os.rename(str(self.physical_path / source), str(self.physical_path / target))
+
+    def _restore_quarantine(self, quarantine: str, name: str) -> None:
+        """Restore a failed quarantine without overwriting a race winner."""
+        try:
+            if self.fd is not None:
+                os.link(
+                    quarantine,
+                    name,
+                    src_dir_fd=self.fd,
+                    dst_dir_fd=self.fd,
+                    follow_symlinks=False,
+                )
+                os.unlink(quarantine, dir_fd=self.fd)
+            else:
+                os.link(
+                    str(self.physical_path / quarantine),
+                    str(self.physical_path / name),
+                    follow_symlinks=False,
+                )
+                os.unlink(str(self.physical_path / quarantine))
+        except OSError:
+            # If the operator has already recreated ``name`` or the platform
+            # cannot hard-link this object, leave the quarantine untouched.
+            return
+
+    def _digest(self, name: str) -> str:
+        """Hash a child opened relative to this validated parent handle."""
+        # Windows CRT descriptors default to text mode and normalize CRLF,
+        # which would make receipt hashes differ from the bytes on disk.
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+        if self.fd is not None:
+            descriptor = os.open(name, flags, dir_fd=self.fd)
+        else:
+            descriptor = os.open(str(self.physical_path / name), flags)
+        try:
+            attributes = os.fstat(descriptor)
+            if _is_reparse_point(Path(name), attributes) or not stat.S_ISREG(attributes.st_mode):
+                raise LifecycleFailure(
+                    EXIT_PREFLIGHT, "receipt", "Receipt-owned path is not a regular file"
+                )
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            return digest.hexdigest()
+        finally:
+            os.close(descriptor)
+
+    def digest(self, name: str) -> str:
+        return self._digest(name)
+
+    def _child_identity(self, name: str) -> tuple[int, int, int, int]:
+        """Return a no-follow identity for a child under this parent handle."""
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+        if self.fd is not None:
+            descriptor = os.open(name, flags, dir_fd=self.fd)
+        else:
+            descriptor = os.open(str(self.physical_path / name), flags)
+        try:
+            attributes = os.fstat(descriptor)
+            if _is_reparse_point(Path(name), attributes) or not stat.S_ISREG(attributes.st_mode):
+                raise LifecycleFailure(
+                    EXIT_PREFLIGHT, "receipt", "Receipt-owned path is not a regular file"
+                )
+            return (
+                int(attributes.st_dev),
+                int(attributes.st_ino),
+                int(attributes.st_size),
+                int(
+                    getattr(
+                        attributes,
+                        "st_mtime_ns",
+                        int(attributes.st_mtime * 1_000_000_000),
+                    )
+                ),
+            )
+        finally:
+            os.close(descriptor)
+
+    def child_identity(self, name: str) -> tuple[int, int, int, int]:
+        return self._child_identity(name)
+
+    def close(self) -> None:
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+        if self.handle not in (None, 0):
+            import ctypes
+
+            ctypes.windll.kernel32.CloseHandle(self.handle)
+            self.handle = None
+
+    def __enter__(self) -> "_ReceiptParentHandle":
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        self.close()
+
+
+def _windows_path_key(path: Path) -> str:
+    """Normalize ordinary and extended-prefix Windows paths for comparison."""
+    value = os.path.normcase(os.path.realpath(str(path)))
+    if value.startswith("\\\\?\\UNC\\"):
+        value = "\\\\" + value[8:]
+    elif value.startswith("\\\\?\\"):
+        value = value[4:]
+    return value.rstrip("\\/")
 
 
 def _validate_receipt(destination: Path, receipt: Mapping[str, Any]) -> None:
@@ -301,8 +732,10 @@ def _validate_receipt(destination: Path, receipt: Mapping[str, Any]) -> None:
         allowed = relative == "%s.desktop" % _PLUGIN_NAME or relative.startswith(
             "%s/" % _PLUGIN_NAME
         )
-        if not allowed or path.is_symlink():
+        if not allowed:
             raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt owns an unexpected path")
+        if os.path.lexists(str(path)):
+            _receipt_file_identity(path, "managed file")
         if not re.fullmatch(r"[0-9a-f]{64}", str(record.get("sha256", ""))):
             raise LifecycleFailure(
                 EXIT_PREFLIGHT, "receipt", "Receipt managed file digest is invalid"
@@ -346,8 +779,87 @@ def _remove_plugin_files(destination: Path) -> None:
         shutil.rmtree(module)
 
 
-def _restore_backup(destination: Path, backup: Mapping[str, Any]) -> None:
-    _remove_plugin_files(destination)
+def _remove_receipt_owned_files(destination: Path, managed_files: list[Mapping[str, Any]]) -> None:
+    """Remove only paths explicitly owned by a validated install receipt."""
+    root = Path(os.path.abspath(str(destination)))
+    validated: list[tuple[Path, str, _ReceiptParentHandle]] = []
+    parent_handles: dict[Path, _ReceiptParentHandle] = {}
+    # Keep every validated parent handle open through the final unlink pass.
+    # Reopening by pathname would allow an inter-phase parent swap to redirect
+    # deletion into an attacker-controlled directory.
+    with ExitStack() as handles:
+        # Validate every receipt entry before mutating any of them. This keeps
+        # a race on a later entry from causing an earlier entry to be removed.
+        for record in managed_files:
+            path = _safe_receipt_path(destination, record.get("path"), "managed file")
+            if not os.path.lexists(str(path)):
+                raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path is missing")
+            parent_handle = parent_handles.get(path.parent)
+            if parent_handle is None:
+                parent_handle = handles.enter_context(_ReceiptParentHandle(path.parent))
+                parent_handles[path.parent] = parent_handle
+            parent_before = _receipt_parent_identities(root, path, "managed file")
+            before = _receipt_file_identity(path, "managed file")
+            # Re-check the no-follow physical identity immediately before
+            # unlink; a replacement with a symlink or another inode fails closed.
+            parent_after = _receipt_parent_identities(root, path, "managed file")
+            after = _receipt_file_identity(path, "managed file")
+            parent_handle.revalidate()
+            content_digest = parent_handle.digest(path.name)
+            content_identity = _receipt_file_identity(path, "managed file")
+            parent_handle.revalidate()
+            if (
+                before != after
+                or parent_before != parent_after
+                or content_identity != after
+                or content_digest != str(record.get("sha256", ""))
+            ):
+                raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path changed")
+            validated.append((path, str(record.get("sha256", "")), parent_handle))
+
+        # Perform the final no-follow content check and unlink through the same
+        # held parent handle used during validation.
+        for path, expected_digest, parent_handle in validated:
+            parent_handle.revalidate()
+            before_identity = parent_handle.child_identity(path.name)
+            if parent_handle.digest(path.name) != expected_digest:
+                raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path changed")
+            parent_handle.revalidate()
+            if parent_handle.child_identity(path.name) != before_identity:
+                raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path changed")
+            parent_handle.unlink(
+                path.name,
+                expected_identity=before_identity,
+                expected_digest=expected_digest,
+            )
+    module = destination / _PLUGIN_NAME
+    if module.is_dir():
+        # Receipt entries own files, not directory containers.  Prune only
+        # containers left empty by those removals, preserving operator files.
+        for directory in sorted(
+            (path for path in module.rglob("*") if path.is_dir()),
+            key=lambda path: len(path.parts),
+            reverse=True,
+        ):
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+        try:
+            module.rmdir()
+        except OSError:
+            pass
+
+
+def _restore_backup(
+    destination: Path,
+    backup: Mapping[str, Any],
+    managed_files: Optional[list[Mapping[str, Any]]] = None,
+) -> None:
+    if managed_files is None:
+        _remove_plugin_files(destination)
+    else:
+        _remove_receipt_owned_files(destination, managed_files)
     backup_root = destination / str(backup.get("root", ""))
     if backup.get("desktop"):
         shutil.copy2(
@@ -356,6 +868,23 @@ def _restore_backup(destination: Path, backup: Mapping[str, Any]) -> None:
         )
     if backup.get("module"):
         shutil.copytree(backup_root / _PLUGIN_NAME, destination / _PLUGIN_NAME)
+
+
+def _restore_receipt_owned_from_backup(
+    destination: Path,
+    backup: Mapping[str, Any],
+    managed_files: list[Mapping[str, Any]],
+) -> None:
+    """Restore only missing receipt-owned files after a failed uninstall."""
+    backup_root = _safe_receipt_path(destination, backup.get("root"), "backup root")
+    for record in managed_files:
+        relative = record.get("path")
+        source = _safe_receipt_path(backup_root, relative, "backup file")
+        target = _safe_receipt_path(destination, relative, "managed file")
+        if target.exists() or not source.is_file():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
 
 
 def _remove_backup(destination: Path, backup: Mapping[str, Any]) -> None:
@@ -581,7 +1110,15 @@ def _result(
     directly_usable: bool = False,
 ) -> dict[str, Any]:
     """Build the thin adapter-local result envelope pending the shared Core facade."""
-    receipt = _receipt_path(destination) if destination is not None else None
+    if destination is not None:
+        try:
+            receipt = _receipt_path(destination)
+        except (LifecycleFailure, OSError):
+            # Keep failure reporting structured even when the receipt
+            # container itself is a reparse point or otherwise unsafe.
+            receipt = destination / _RECEIPT_RELATIVE
+    else:
+        receipt = None
     return {
         "schema_version": _SCHEMA_VERSION,
         "operation": request.operation,
@@ -766,10 +1303,7 @@ def run_lifecycle(request: LifecycleRequest) -> dict[str, Any]:
             except BaseException:
                 _restore_backup(destination, rollback)
                 _remove_backup(destination, rollback)
-                if prior_receipt is None:
-                    _receipt_path(destination).unlink(missing_ok=True)
-                else:
-                    _atomic_write(_receipt_path(destination), prior_receipt)
+                _safe_restore_receipt(destination, prior_receipt)
                 raise
             if receipt is not None:
                 _remove_backup(destination, rollback)
@@ -794,15 +1328,40 @@ def run_lifecycle(request: LifecycleRequest) -> dict[str, Any]:
                 detected=detected,
             )
         rollback = _backup_existing(destination)
-        prior_receipt = _receipt_path(destination).read_bytes()
+        receipt_path = _receipt_path(destination)
+        prior_receipt = receipt_path.read_bytes()
+        receipt_parent = _ReceiptParentHandle(receipt_path.parent)
         try:
-            _restore_backup(destination, receipt.get("backup", {}))
-            _receipt_path(destination).unlink()
-        except BaseException:
-            _restore_backup(destination, rollback)
-            _atomic_write(_receipt_path(destination), prior_receipt)
+            receipt_identity = receipt_parent.child_identity(receipt_path.name)
+            receipt_digest = receipt_parent.digest(receipt_path.name)
+            _restore_backup(
+                destination,
+                receipt.get("backup", {}),
+                receipt.get("managed_files", []),
+            )
+            receipt_parent.revalidate()
+            receipt_parent.unlink(
+                receipt_path.name,
+                expected_identity=receipt_identity,
+                expected_digest=receipt_digest,
+            )
+        except BaseException as exc:
+            # Receipt validation failures are fail-closed: do not recursively
+            # delete the plug-in tree while rolling back, because that could
+            # remove an operator-owned replacement discovered in the race.
+            if isinstance(exc, LifecycleFailure) and exc.stage == "receipt":
+                _restore_receipt_owned_from_backup(
+                    destination,
+                    rollback,
+                    receipt.get("managed_files", []),
+                )
+            else:
+                _restore_backup(destination, rollback)
+            _safe_restore_receipt(destination, prior_receipt)
             _remove_backup(destination, rollback)
             raise
+        finally:
+            receipt_parent.close()
         for obsolete_backup in (rollback, receipt.get("backup", {})):
             try:
                 _remove_backup(destination, obsolete_backup)
