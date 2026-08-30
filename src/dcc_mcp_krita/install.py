@@ -515,7 +515,12 @@ class _ReceiptParentHandle:
             # replacement seam between the final digest and quarantine unlink.
             if sample()[0] != actual_identity:
                 raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path changed")
-            self._unlink_name(quarantine)
+            # Keep the final unlink in this primitive; calling an overridable
+            # helper here would reopen a replacement seam after sampling.
+            if self.fd is not None:
+                os.unlink(quarantine, dir_fd=self.fd)
+            else:
+                os.unlink(str(self.physical_path / quarantine))
             keep_quarantine = False
         finally:
             if keep_quarantine:
@@ -526,21 +531,6 @@ class _ReceiptParentHandle:
             os.rename(source, target, src_dir_fd=self.fd, dst_dir_fd=self.fd)
         else:
             os.rename(str(self.physical_path / source), str(self.physical_path / target))
-
-    def _unlink_name(
-        self,
-        name: str,
-        expected_identity: Optional[tuple[int, int, int, int]] = None,
-        expected_digest: Optional[str] = None,
-    ) -> None:
-        # Ownership checks are completed by ``unlink`` while the entry is in
-        # quarantine. Keep this final operation deliberately non-interposable:
-        # no overridable identity/digest hook runs between validation and the
-        # single unlink syscall.
-        if self.fd is not None:
-            os.unlink(name, dir_fd=self.fd)
-        else:
-            os.unlink(str(self.physical_path / name))
 
     def _restore_quarantine(self, quarantine: str, name: str) -> None:
         """Restore a failed quarantine without overwriting a race winner."""
