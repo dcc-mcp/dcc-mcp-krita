@@ -404,6 +404,7 @@ class _ReceiptParentHandle:
         self.fd: Optional[int] = None
         self.handle: Any = None
         self.physical_path = path
+        self.windows_file_id: Optional[tuple[int, int, int]] = None
         # Reject symlink/junction parents before opening any platform handle.
         _assert_no_reparse_components(self.path.parent, self.path, "managed file")
         if os.name == "nt":
@@ -436,6 +437,31 @@ class _ReceiptParentHandle:
             self.close()
             raise OSError("Could not resolve receipt parent directory handle")
         self.physical_path = Path(buffer.value)
+        self.windows_file_id = self._windows_handle_identity(self.handle)
+
+    @staticmethod
+    def _windows_handle_identity(handle: Any) -> tuple[int, int, int]:
+        import ctypes
+        from ctypes import wintypes
+
+        class FileInfo(ctypes.Structure):
+            _fields_ = [
+                ("attributes", wintypes.DWORD),
+                ("created", wintypes.FILETIME),
+                ("accessed", wintypes.FILETIME),
+                ("written", wintypes.FILETIME),
+                ("volume", wintypes.DWORD),
+                ("size_high", wintypes.DWORD),
+                ("size_low", wintypes.DWORD),
+                ("links", wintypes.DWORD),
+                ("index_high", wintypes.DWORD),
+                ("index_low", wintypes.DWORD),
+            ]
+
+        info = FileInfo()
+        if not ctypes.windll.kernel32.GetFileInformationByHandle(handle, ctypes.byref(info)):
+            raise ctypes.WinError()
+        return (int(info.volume), int(info.index_high), int(info.index_low))
 
     def identity(self) -> tuple[str, str]:
         if self.fd is not None:
@@ -449,9 +475,27 @@ class _ReceiptParentHandle:
     def revalidate(self) -> None:
         _assert_no_reparse_components(self.path.parent, self.path, "managed file")
         if os.name == "nt":
-            current = _windows_path_key(self.path)
-            opened = _windows_path_key(self.physical_path)
-            if current != opened:
+            import ctypes
+            from ctypes import wintypes
+
+            create_file = ctypes.windll.kernel32.CreateFileW
+            create_file.restype = wintypes.HANDLE
+            current_handle = create_file(
+                str(self.path),
+                0x0001,  # FILE_LIST_DIRECTORY
+                0x00000001 | 0x00000002 | 0x00000004,
+                None,
+                3,
+                0x02000000 | 0x00200000,
+                None,
+            )
+            if current_handle in (None, wintypes.HANDLE(-1).value):
+                raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt parent changed")
+            try:
+                current_id = self._windows_handle_identity(current_handle)
+            finally:
+                ctypes.windll.kernel32.CloseHandle(current_handle)
+            if current_id != self.windows_file_id:
                 raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt parent changed")
         elif self.fd is not None:
             current = os.lstat(str(self.path))
