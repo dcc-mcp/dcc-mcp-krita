@@ -410,7 +410,10 @@ class _ReceiptParentHandle:
         if os.name == "nt":
             self._open_windows()
         elif os.unlink in getattr(os, "supports_dir_fd", set()):
-            self.fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            self.fd = os.open(
+                str(path),
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            )
 
     def _open_windows(self) -> None:
         import ctypes
@@ -421,7 +424,7 @@ class _ReceiptParentHandle:
         self.handle = create_file(
             str(self.path),
             0x0001,  # FILE_LIST_DIRECTORY
-            0x00000001 | 0x00000002 | 0x00000004,  # share read/write/delete
+            0x00000001 | 0x00000002,  # share read/write; deny parent delete/rename
             None,
             3,  # OPEN_EXISTING
             0x02000000 | 0x00200000,  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
@@ -483,7 +486,7 @@ class _ReceiptParentHandle:
             current_handle = create_file(
                 str(self.path),
                 0x0001,  # FILE_LIST_DIRECTORY
-                0x00000001 | 0x00000002 | 0x00000004,
+                0x00000001 | 0x00000002,
                 None,
                 3,
                 0x02000000 | 0x00200000,
