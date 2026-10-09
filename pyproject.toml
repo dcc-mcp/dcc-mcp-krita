@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dcc-mcp-krita"
-version = "0.4.0"
+version = "0.5.0"
 description = "Typed document, layer, painting, and export automation for Krita"
 readme = "README.md"
 requires-python = ">=3.9"
