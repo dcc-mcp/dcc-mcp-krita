@@ -856,10 +856,130 @@ def _restore_backup(
     backup: Mapping[str, Any],
     managed_files: Optional[list[Mapping[str, Any]]] = None,
 ) -> None:
-    if managed_files is None:
-        _remove_plugin_files(destination)
-    else:
-        _remove_receipt_owned_files(destination, managed_files)
+    if managed_files is not None:
+        try:
+            backup_root = _safe_receipt_path(destination, backup.get("root"), "backup root")
+            sources: list[Path] = []
+            if backup.get("desktop"):
+                sources.append(backup_root / ("%s.desktop" % _PLUGIN_NAME))
+            if backup.get("module"):
+                module = backup_root / _PLUGIN_NAME
+                sources.extend([module, *sorted(module.rglob("*"))])
+            managed_paths = {
+                _safe_receipt_path(destination, record.get("path"), "managed file")
+                for record in managed_files
+            }
+            directories: list[Path] = []
+            files: list[tuple[Path, Path]] = []
+            # Validate the complete merge before removing any managed file. An
+            # existing operator file is a conflict even if its bytes happen to match.
+            for source in sources:
+                relative = source.relative_to(backup_root).as_posix()
+                source = _safe_receipt_path(backup_root, relative, "backup file")
+                target = _safe_receipt_path(destination, relative, "backup restore")
+                if source.is_dir():
+                    if (
+                        os.path.lexists(str(target))
+                        and not target.is_dir()
+                        and target not in managed_paths
+                    ):
+                        raise LifecycleFailure(
+                            EXIT_PREFLIGHT,
+                            "receipt",
+                            "Backup restore path conflicts with an unowned path",
+                        )
+                    directories.append(target)
+                else:
+                    _receipt_file_identity(source, "backup file")
+                    if os.path.lexists(str(target)) and target not in managed_paths:
+                        raise LifecycleFailure(
+                            EXIT_PREFLIGHT,
+                            "receipt",
+                            "Backup restore path conflicts with an unowned path",
+                        )
+                    files.append((source, target))
+            with tempfile.TemporaryDirectory(prefix=".krita-restore-", dir=destination) as staging:
+                staged: list[tuple[Path, Path, tuple[int, int, int, int], str]] = []
+                for index, (source, target) in enumerate(files):
+                    identity = _receipt_file_identity(source, "backup file")
+                    digest = _sha256(source)
+                    staged_file = Path(staging) / str(index)
+                    shutil.copy2(source, staged_file)
+                    if (
+                        _receipt_file_identity(source, "backup file") != identity
+                        or _sha256(staged_file) != digest
+                    ):
+                        raise LifecycleFailure(
+                            EXIT_PREFLIGHT, "receipt", "Backup file changed during restore"
+                        )
+                    staged.append(
+                        (
+                            staged_file,
+                            target,
+                            _receipt_file_identity(staged_file, "backup file"),
+                            digest,
+                        )
+                    )
+                published: list[
+                    tuple[_ReceiptParentHandle, str, tuple[int, int, int, int], str]
+                ] = []
+                with ExitStack() as handles:
+                    try:
+                        _remove_receipt_owned_files(destination, managed_files)
+                        for directory in directories:
+                            relative = directory.relative_to(destination).as_posix()
+                            _safe_receipt_path(destination, relative, "backup restore").mkdir(
+                                exist_ok=True
+                            )
+                        for staged_file, target, identity, digest in staged:
+                            relative = target.relative_to(destination).as_posix()
+                            target = _safe_receipt_path(destination, relative, "backup restore")
+                            parent = handles.enter_context(_ReceiptParentHandle(target.parent))
+                            parent.revalidate()
+                            try:
+                                # Windows rename refuses an existing destination;
+                                # POSIX needs an exclusive link through the held parent.
+                                if os.name == "nt":
+                                    os.rename(staged_file, parent.physical_path / target.name)
+                                elif parent.fd is not None:
+                                    os.link(
+                                        staged_file,
+                                        target.name,
+                                        dst_dir_fd=parent.fd,
+                                        follow_symlinks=False,
+                                    )
+                                else:
+                                    os.link(
+                                        staged_file,
+                                        parent.physical_path / target.name,
+                                        follow_symlinks=False,
+                                    )
+                            except FileExistsError as exc:
+                                raise LifecycleFailure(
+                                    EXIT_PREFLIGHT,
+                                    "receipt",
+                                    "Backup restore path conflicts with an unowned path",
+                                ) from exc
+                            published.append((parent, target.name, identity, digest))
+                            parent.revalidate()
+                            if (
+                                parent.child_identity(target.name) != identity
+                                or parent.digest(target.name) != digest
+                            ):
+                                raise LifecycleFailure(
+                                    EXIT_PREFLIGHT, "receipt", "Backup restore path changed"
+                                )
+                    except BaseException:
+                        # Remove only our identity-bound publications. The existing
+                        # receipt-stage recovery then restores missing managed files
+                        # without recursively deleting operator data or replacements.
+                        for parent, name, identity, digest in reversed(published):
+                            parent.unlink(name, expected_identity=identity, expected_digest=digest)
+                        raise
+        except OSError as exc:
+            raise LifecycleFailure(EXIT_INSTALL, "receipt", str(exc)) from exc
+        return
+    _remove_plugin_files(destination)
     backup_root = destination / str(backup.get("root", ""))
     if backup.get("desktop"):
         shutil.copy2(
