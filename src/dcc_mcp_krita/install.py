@@ -19,6 +19,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
+from importlib.util import source_from_cache
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
@@ -779,8 +780,12 @@ def _remove_plugin_files(destination: Path) -> None:
         shutil.rmtree(module)
 
 
-def _remove_receipt_owned_files(destination: Path, managed_files: list[Mapping[str, Any]]) -> None:
-    """Remove only paths explicitly owned by a validated install receipt."""
+def _remove_receipt_owned_files(
+    destination: Path,
+    managed_files: list[Mapping[str, Any]],
+    expected_paths: Optional[Mapping[Path, tuple[Any, ...]]] = None,
+) -> None:
+    """Remove validated receipt files or explicitly planned source-derived caches."""
     root = Path(os.path.abspath(str(destination)))
     validated: list[tuple[Path, str, _ReceiptParentHandle]] = []
     parent_handles: dict[Path, _ReceiptParentHandle] = {}
@@ -800,6 +805,9 @@ def _remove_receipt_owned_files(destination: Path, managed_files: list[Mapping[s
                 parent_handles[path.parent] = parent_handle
             parent_before = _receipt_parent_identities(root, path, "managed file")
             before = _receipt_file_identity(path, "managed file")
+            if expected_paths and path in expected_paths:
+                if (before, parent_before) != expected_paths[path]:
+                    raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Generated cache changed")
             # Re-check the no-follow physical identity immediately before
             # unlink; a replacement with a symlink or another inode fails closed.
             parent_after = _receipt_parent_identities(root, path, "managed file")
@@ -851,6 +859,16 @@ def _remove_receipt_owned_files(destination: Path, managed_files: list[Mapping[s
             pass
 
 
+def _cache_source(path: Path) -> Optional[Path]:
+    """Identify source-associated PEP 3147 caches without assuming the host tag."""
+    if path.parent.name != "__pycache__" or path.suffix != ".pyc":
+        return None
+    try:
+        return Path(source_from_cache(str(path)))
+    except (ValueError, NotImplementedError):
+        return None
+
+
 def _restore_backup(
     destination: Path,
     backup: Mapping[str, Any],
@@ -871,12 +889,23 @@ def _restore_backup(
             }
             directories: list[Path] = []
             files: list[tuple[Path, Path]] = []
-            # Validate the complete merge before removing any managed file. An
-            # existing operator file is a conflict even if its bytes happen to match.
+            validated_sources: list[tuple[Path, Path]] = []
             for source in sources:
                 relative = source.relative_to(backup_root).as_posix()
                 source = _safe_receipt_path(backup_root, relative, "backup file")
                 target = _safe_receipt_path(destination, relative, "backup restore")
+                if not source.is_dir():
+                    _receipt_file_identity(source, "backup file")
+                validated_sources.append((source, target))
+            restored_sources = {
+                target
+                for source, target in validated_sources
+                if source.suffix == ".py" and source.is_file() and target in managed_paths
+            }
+            # Validate the complete merge before removing any managed file. An
+            # existing operator file is a conflict even if its bytes happen to match.
+            for source, target in validated_sources:
+                relative = source.relative_to(backup_root).as_posix()
                 if source.is_dir():
                     if (
                         os.path.lexists(str(target))
@@ -886,18 +915,48 @@ def _restore_backup(
                         raise LifecycleFailure(
                             EXIT_PREFLIGHT,
                             "receipt",
-                            "Backup restore path conflicts with an unowned path",
+                            "Backup restore path conflicts with an unowned path: %r" % relative,
                         )
                     directories.append(target)
                 else:
                     _receipt_file_identity(source, "backup file")
+                    if _cache_source(target) in restored_sources:
+                        # Never restore stale bytecode for a restored owned source.
+                        continue
                     if os.path.lexists(str(target)) and target not in managed_paths:
                         raise LifecycleFailure(
                             EXIT_PREFLIGHT,
                             "receipt",
-                            "Backup restore path conflicts with an unowned path",
+                            "Backup restore path conflicts with an unowned path: %r" % relative,
                         )
                     files.append((source, target))
+            cache_records: list[Mapping[str, Any]] = []
+            cache_identities: dict[Path, tuple[Any, ...]] = {}
+            for directory in sorted({source.parent / "__pycache__" for source in restored_sources}):
+                relative = directory.relative_to(destination).as_posix()
+                directory = _safe_receipt_path(destination, relative, "generated cache")
+                if not directory.is_dir():
+                    continue
+                for cache in sorted(directory.iterdir()):
+                    if _cache_source(cache) not in restored_sources or cache in managed_paths:
+                        continue
+                    relative = cache.relative_to(destination).as_posix()
+                    cache = _safe_receipt_path(destination, relative, "generated cache")
+                    before = _receipt_file_identity(cache, "generated cache")
+                    parents = _receipt_parent_identities(destination, cache, "generated cache")
+                    with _ReceiptParentHandle(cache.parent) as parent:
+                        digest = parent.digest(cache.name)
+                        parent.revalidate()
+                        if (
+                            parent.child_identity(cache.name) != before
+                            or _receipt_parent_identities(destination, cache, "generated cache")
+                            != parents
+                        ):
+                            raise LifecycleFailure(
+                                EXIT_PREFLIGHT, "receipt", "Generated cache changed"
+                            )
+                    cache_records.append({"path": relative, "sha256": digest})
+                    cache_identities[cache] = (before, parents)
             with tempfile.TemporaryDirectory(prefix=".krita-restore-", dir=destination) as staging:
                 staged: list[tuple[Path, Path, tuple[int, int, int, int], str]] = []
                 for index, (source, target) in enumerate(files):
@@ -951,7 +1010,14 @@ def _restore_backup(
                 ] = []
                 with ExitStack() as handles:
                     try:
-                        _remove_receipt_owned_files(destination, managed_files)
+                        # Invalidate source-backed caches first, including ones
+                        # generated after install. All other unowned files stay guarded.
+                        if cache_records:
+                            _remove_receipt_owned_files(
+                                destination, cache_records + managed_files, cache_identities
+                            )
+                        else:
+                            _remove_receipt_owned_files(destination, managed_files)
                         for directory in directories:
                             relative = directory.relative_to(destination).as_posix()
                             _safe_receipt_path(destination, relative, "backup restore").mkdir(
@@ -984,7 +1050,8 @@ def _restore_backup(
                                 raise LifecycleFailure(
                                     EXIT_PREFLIGHT,
                                     "receipt",
-                                    "Backup restore path conflicts with an unowned path",
+                                    "Backup restore path conflicts with an unowned path: %r"
+                                    % relative,
                                 ) from exc
                             published.append((parent, target.name, identity, digest))
                             parent.revalidate()

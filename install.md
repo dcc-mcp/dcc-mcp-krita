@@ -104,9 +104,15 @@ Close Krita and use the receipt-owned uninstall path:
 dcc-mcp-krita uninstall --dcc-path /path/to/krita --yes --json
 ```
 
-Uninstall removes only receipt-owned files and restores any plug-in files that
-were present before the adapter install. Missing, invalid, or partial receipts
-fail closed rather than deleting unowned content.
+Uninstall removes receipt-owned files and restores any plug-in files that were
+present before the adapter install. When restoring a receipt-owned Python source,
+its source-associated `__pycache__` bytecode is invalidated rather than restored,
+including caches created after installation. Legacy/source-less bytecode and
+other operator files are preserved or reported as explicit path conflicts.
+These generated caches may also be invalidated during a failed restore; source
+files, the receipt, and other operator data retain the existing recovery rules.
+Missing, invalid, or partial receipts fail closed rather than deleting unowned
+content.
 
 ## JSON and exit codes
 
