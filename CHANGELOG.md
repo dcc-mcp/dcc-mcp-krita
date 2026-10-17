@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.5.0](https://github.com/dcc-mcp/dcc-mcp-krita/compare/v0.4.0...v0.5.0) (2026-10-17)
+
+
+### Features
+
+* align Krita install staging and skill guidance ([#9](https://github.com/dcc-mcp/dcc-mcp-krita/issues/9)) ([5bd6fc6](https://github.com/dcc-mcp/dcc-mcp-krita/commit/5bd6fc6665e396f696ff6f2c6d3115b263762f67))
+
+
+### Bug Fixes
+
+* preserve user files during Krita backup restoration ([#14](https://github.com/dcc-mcp/dcc-mcp-krita/issues/14)) ([085acef](https://github.com/dcc-mcp/dcc-mcp-krita/commit/085acef8f2c37d10226eadd2b64ccefb848ce13d))
+
+
+### Documentation
+
+* add the generated DCC-MCP host matrix pointer ([e5f4adc](https://github.com/dcc-mcp/dcc-mcp-krita/commit/e5f4adc29703e76ecc8945cbb68553800139e105))
+* clarify Krita uninstall cache handling ([#15](https://github.com/dcc-mcp/dcc-mcp-krita/issues/15)) ([b2ee423](https://github.com/dcc-mcp/dcc-mcp-krita/commit/b2ee423c51d7709425ba630b7d9c5d2fe35196c9))
+* **readme:** add the generated DCC-MCP host matrix pointer ([2ed3485](https://github.com/dcc-mcp/dcc-mcp-krita/commit/2ed3485a1e43effe8560ca31a5bfef4d78577589))
+* regenerate host matrix pointer block from the current catalog ([3bb40ee](https://github.com/dcc-mcp/dcc-mcp-krita/commit/3bb40ee7da96f51e1bb9253b0ef69b167174f6f2))
+
 ## [0.4.0](https://github.com/dcc-mcp/dcc-mcp-krita/compare/v0.3.0...v0.4.0) (2026-08-25)
 
 
