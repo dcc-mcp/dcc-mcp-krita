@@ -440,6 +440,55 @@ def test_backup_restore_permission_error_preserves_restart_contract(
     assert (backup / "dcc_mcp_krita/legacy.txt").read_bytes() == b"original legacy\n"
 
 
+def test_repair_uninstall_preserves_backup_extended_attributes(tmp_path: Path, monkeypatch) -> None:
+    if os.name != "posix" or not all(hasattr(os, name) for name in ("setxattr", "getxattr")):
+        pytest.skip("POSIX extended attributes are unavailable")
+    import errno
+
+    import dcc_mcp_krita.install as installer
+
+    class Probe:
+        returncode = 0
+        stdout = "Krita 5.2.11\n"
+
+    monkeypatch.setattr(installer.subprocess, "run", lambda *args, **kwargs: Probe())
+    destination = tmp_path / "pykrita"
+    module = destination / "dcc_mcp_krita"
+    module.mkdir(parents=True)
+    legacy = module / "legacy.txt"
+    legacy.write_bytes(b"previous file\n")
+    attribute = "user.dcc_mcp_krita_restore"
+    try:
+        os.setxattr(legacy, attribute, b"previous metadata")
+    except OSError as exc:
+        if exc.errno in {errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP}:
+            pytest.skip("The temporary filesystem does not support extended attributes")
+        raise
+    host = tmp_path / "krita.exe"
+    host.touch()
+    request = installer.LifecycleRequest(
+        operation="install",
+        dcc_path=host,
+        python_path=Path(sys.executable),
+        destination=destination,
+        yes=True,
+        repair=True,
+    )
+    assert installer.run_lifecycle(request)["exit_code"] == 0
+    receipt = destination / ".dcc-mcp/receipts/krita.json"
+    backup = destination / json.loads(receipt.read_bytes())["backup"]["root"]
+    assert os.getxattr(backup / "dcc_mcp_krita/legacy.txt", attribute) == b"previous metadata"
+    (module / "operator.txt").write_bytes(b"operator-owned\n")
+
+    result = installer.run_lifecycle(request.with_operation("uninstall"))
+
+    assert result["exit_code"] == 0
+    assert legacy.read_bytes() == b"previous file\n"
+    assert os.getxattr(legacy, attribute) == b"previous metadata"
+    assert (module / "operator.txt").read_bytes() == b"operator-owned\n"
+    assert not receipt.exists()
+
+
 @pytest.mark.parametrize("cleanup_failure", ["locked", "replacement"])
 def test_backup_restore_attempts_all_cleanup_and_retains_incomplete_recovery(
     repair_restore_case, monkeypatch, cleanup_failure: str

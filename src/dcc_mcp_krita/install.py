@@ -936,9 +936,8 @@ def _restore_backup(
                             raise LifecycleFailure(
                                 EXIT_PREFLIGHT, "receipt", "Backup file changed during restore"
                             )
-                    # Metadata belongs to the held inode, never to a reopened path.
-                    os.chmod(staged_file, stat.S_IMODE(attributes.st_mode))
-                    os.utime(staged_file, ns=(attributes.st_atime_ns, attributes.st_mtime_ns))
+                        # Preserve copy2 metadata through the same held source inode.
+                        shutil.copystat(original.fileno(), staged_file)
                     staged.append(
                         (
                             staged_file,
