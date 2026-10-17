@@ -19,6 +19,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
+from importlib.util import source_from_cache
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
@@ -779,8 +780,12 @@ def _remove_plugin_files(destination: Path) -> None:
         shutil.rmtree(module)
 
 
-def _remove_receipt_owned_files(destination: Path, managed_files: list[Mapping[str, Any]]) -> None:
-    """Remove only paths explicitly owned by a validated install receipt."""
+def _remove_receipt_owned_files(
+    destination: Path,
+    managed_files: list[Mapping[str, Any]],
+    expected_paths: Optional[Mapping[Path, tuple[Any, ...]]] = None,
+) -> None:
+    """Remove validated receipt files or explicitly planned source-derived caches."""
     root = Path(os.path.abspath(str(destination)))
     validated: list[tuple[Path, str, _ReceiptParentHandle]] = []
     parent_handles: dict[Path, _ReceiptParentHandle] = {}
@@ -800,6 +805,9 @@ def _remove_receipt_owned_files(destination: Path, managed_files: list[Mapping[s
                 parent_handles[path.parent] = parent_handle
             parent_before = _receipt_parent_identities(root, path, "managed file")
             before = _receipt_file_identity(path, "managed file")
+            if expected_paths and path in expected_paths:
+                if (before, parent_before) != expected_paths[path]:
+                    raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Generated cache changed")
             # Re-check the no-follow physical identity immediately before
             # unlink; a replacement with a symlink or another inode fails closed.
             parent_after = _receipt_parent_identities(root, path, "managed file")
@@ -822,6 +830,9 @@ def _remove_receipt_owned_files(destination: Path, managed_files: list[Mapping[s
         for path, expected_digest, parent_handle in validated:
             parent_handle.revalidate()
             before_identity = parent_handle.child_identity(path.name)
+            if expected_paths and path in expected_paths:
+                if before_identity != expected_paths[path][0]:
+                    raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Generated cache changed")
             if parent_handle.digest(path.name) != expected_digest:
                 raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path changed")
             parent_handle.revalidate()
@@ -851,15 +862,238 @@ def _remove_receipt_owned_files(destination: Path, managed_files: list[Mapping[s
             pass
 
 
+def _cache_source(path: Path) -> Optional[Path]:
+    """Identify source-associated PEP 3147 caches without assuming the host tag."""
+    if path.parent.name != "__pycache__" or path.suffix != ".pyc":
+        return None
+    try:
+        return Path(source_from_cache(str(path)))
+    except (ValueError, NotImplementedError):
+        return None
+
+
 def _restore_backup(
     destination: Path,
     backup: Mapping[str, Any],
     managed_files: Optional[list[Mapping[str, Any]]] = None,
 ) -> None:
-    if managed_files is None:
-        _remove_plugin_files(destination)
-    else:
-        _remove_receipt_owned_files(destination, managed_files)
+    if managed_files is not None:
+        try:
+            backup_root = _safe_receipt_path(destination, backup.get("root"), "backup root")
+            sources: list[Path] = []
+            if backup.get("desktop"):
+                sources.append(backup_root / ("%s.desktop" % _PLUGIN_NAME))
+            if backup.get("module"):
+                module = backup_root / _PLUGIN_NAME
+                sources.extend([module, *sorted(module.rglob("*"))])
+            managed_paths = {
+                _safe_receipt_path(destination, record.get("path"), "managed file")
+                for record in managed_files
+            }
+            directories: list[Path] = []
+            files: list[tuple[Path, Path]] = []
+            validated_sources: list[tuple[Path, Path]] = []
+            for source in sources:
+                relative = source.relative_to(backup_root).as_posix()
+                source = _safe_receipt_path(backup_root, relative, "backup file")
+                target = _safe_receipt_path(destination, relative, "backup restore")
+                if not source.is_dir():
+                    _receipt_file_identity(source, "backup file")
+                validated_sources.append((source, target))
+            restored_sources = {
+                target
+                for source, target in validated_sources
+                if source.suffix == ".py" and source.is_file() and target in managed_paths
+            }
+            # Validate the complete merge before removing any managed file. An
+            # existing operator file is a conflict even if its bytes happen to match.
+            for source, target in validated_sources:
+                relative = source.relative_to(backup_root).as_posix()
+                if source.is_dir():
+                    if (
+                        os.path.lexists(str(target))
+                        and not target.is_dir()
+                        and target not in managed_paths
+                    ):
+                        raise LifecycleFailure(
+                            EXIT_PREFLIGHT,
+                            "receipt",
+                            "Backup restore path conflicts with an unowned path: %r" % relative,
+                        )
+                    directories.append(target)
+                else:
+                    _receipt_file_identity(source, "backup file")
+                    if _cache_source(target) in restored_sources:
+                        # Never restore stale bytecode for a restored owned source.
+                        continue
+                    if os.path.lexists(str(target)) and target not in managed_paths:
+                        raise LifecycleFailure(
+                            EXIT_PREFLIGHT,
+                            "receipt",
+                            "Backup restore path conflicts with an unowned path: %r" % relative,
+                        )
+                    files.append((source, target))
+            cache_records: list[Mapping[str, Any]] = []
+            cache_identities: dict[Path, tuple[Any, ...]] = {}
+            for directory in sorted({source.parent / "__pycache__" for source in restored_sources}):
+                relative = directory.relative_to(destination).as_posix()
+                directory = _safe_receipt_path(destination, relative, "generated cache")
+                if not directory.is_dir():
+                    continue
+                for cache in sorted(directory.iterdir()):
+                    if _cache_source(cache) not in restored_sources or cache in managed_paths:
+                        continue
+                    relative = cache.relative_to(destination).as_posix()
+                    cache = _safe_receipt_path(destination, relative, "generated cache")
+                    before = _receipt_file_identity(cache, "generated cache")
+                    parents = _receipt_parent_identities(destination, cache, "generated cache")
+                    with _ReceiptParentHandle(cache.parent) as parent:
+                        digest = parent.digest(cache.name)
+                        parent.revalidate()
+                        if (
+                            parent.child_identity(cache.name) != before
+                            or _receipt_parent_identities(destination, cache, "generated cache")
+                            != parents
+                        ):
+                            raise LifecycleFailure(
+                                EXIT_PREFLIGHT, "receipt", "Generated cache changed"
+                            )
+                    cache_records.append({"path": relative, "sha256": digest})
+                    cache_identities[cache] = (before, parents)
+            with tempfile.TemporaryDirectory(prefix=".krita-restore-", dir=destination) as staging:
+                staged: list[tuple[Path, Path, tuple[int, int, int, int], str]] = []
+                for index, (source, target) in enumerate(files):
+                    identity = _receipt_file_identity(source, "backup file")
+                    staged_file = Path(staging) / str(index)
+                    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+                    descriptor = os.open(source, flags)
+                    with os.fdopen(descriptor, "rb") as original:
+                        attributes = os.fstat(original.fileno())
+                        opened_identity = (
+                            int(attributes.st_dev),
+                            int(attributes.st_ino),
+                            int(attributes.st_size),
+                            int(attributes.st_mtime_ns),
+                        )
+                        if (
+                            _is_reparse_point(source, attributes)
+                            or not stat.S_ISREG(attributes.st_mode)
+                            or opened_identity != identity
+                        ):
+                            raise LifecycleFailure(
+                                EXIT_PREFLIGHT, "receipt", "Backup file changed during restore"
+                            )
+                        digest = hashlib.sha256()
+                        with staged_file.open("xb") as copied:
+                            for chunk in iter(lambda: original.read(1024 * 1024), b""):
+                                copied.write(chunk)
+                                digest.update(chunk)
+                        after = os.fstat(original.fileno())
+                        if (
+                            int(after.st_dev),
+                            int(after.st_ino),
+                            int(after.st_size),
+                            int(after.st_mtime_ns),
+                        ) != identity:
+                            raise LifecycleFailure(
+                                EXIT_PREFLIGHT, "receipt", "Backup file changed during restore"
+                            )
+                        # Preserve copy2 metadata through the same held source inode.
+                        shutil.copystat(original.fileno(), staged_file)
+                    staged.append(
+                        (
+                            staged_file,
+                            target,
+                            _receipt_file_identity(staged_file, "backup file"),
+                            digest.hexdigest(),
+                        )
+                    )
+                published: list[
+                    tuple[_ReceiptParentHandle, str, tuple[int, int, int, int], str]
+                ] = []
+                with ExitStack() as handles:
+                    try:
+                        # Invalidate source-backed caches first, including ones
+                        # generated after install. All other unowned files stay guarded.
+                        if cache_records:
+                            _remove_receipt_owned_files(
+                                destination, cache_records + managed_files, cache_identities
+                            )
+                        else:
+                            _remove_receipt_owned_files(destination, managed_files)
+                        for directory in directories:
+                            relative = directory.relative_to(destination).as_posix()
+                            _safe_receipt_path(destination, relative, "backup restore").mkdir(
+                                exist_ok=True
+                            )
+                        for staged_file, target, identity, digest in staged:
+                            relative = target.relative_to(destination).as_posix()
+                            target = _safe_receipt_path(destination, relative, "backup restore")
+                            parent = handles.enter_context(_ReceiptParentHandle(target.parent))
+                            parent.revalidate()
+                            try:
+                                # Windows rename refuses an existing destination;
+                                # POSIX needs an exclusive link through the held parent.
+                                if os.name == "nt":
+                                    os.rename(staged_file, parent.physical_path / target.name)
+                                elif parent.fd is not None:
+                                    os.link(
+                                        staged_file,
+                                        target.name,
+                                        dst_dir_fd=parent.fd,
+                                        follow_symlinks=False,
+                                    )
+                                else:
+                                    os.link(
+                                        staged_file,
+                                        parent.physical_path / target.name,
+                                        follow_symlinks=False,
+                                    )
+                            except FileExistsError as exc:
+                                raise LifecycleFailure(
+                                    EXIT_PREFLIGHT,
+                                    "receipt",
+                                    "Backup restore path conflicts with an unowned path: %r"
+                                    % relative,
+                                ) from exc
+                            published.append((parent, target.name, identity, digest))
+                            parent.revalidate()
+                            if (
+                                parent.child_identity(target.name) != identity
+                                or parent.digest(target.name) != digest
+                            ):
+                                raise LifecycleFailure(
+                                    EXIT_PREFLIGHT, "receipt", "Backup restore path changed"
+                                )
+                    except BaseException as exc:
+                        # Remove only our identity-bound publications. The existing
+                        # receipt-stage recovery then restores missing managed files
+                        # without recursively deleting operator data or replacements.
+                        recovery_errors = []
+                        for parent, name, identity, digest in reversed(published):
+                            try:
+                                parent.unlink(
+                                    name, expected_identity=identity, expected_digest=digest
+                                )
+                            except (OSError, LifecycleFailure) as cleanup_error:
+                                recovery_errors.append(
+                                    {
+                                        "path": str(parent.path / name),
+                                        "type": type(cleanup_error).__name__,
+                                        "reason": str(cleanup_error),
+                                    }
+                                )
+                        if recovery_errors:
+                            exc.recovery_errors = recovery_errors
+                        raise
+        except PermissionError:
+            raise
+        except OSError as exc:
+            failure = LifecycleFailure(EXIT_INSTALL, "receipt", str(exc))
+            failure.recovery_errors = getattr(exc, "recovery_errors", [])
+            raise failure from exc
+        return
+    _remove_plugin_files(destination)
     backup_root = destination / str(backup.get("root", ""))
     if backup.get("desktop"):
         shutil.copy2(
@@ -1349,16 +1583,53 @@ def run_lifecycle(request: LifecycleRequest) -> dict[str, Any]:
             # Receipt validation failures are fail-closed: do not recursively
             # delete the plug-in tree while rolling back, because that could
             # remove an operator-owned replacement discovered in the race.
-            if isinstance(exc, LifecycleFailure) and exc.stage == "receipt":
-                _restore_receipt_owned_from_backup(
-                    destination,
-                    rollback,
-                    receipt.get("managed_files", []),
-                )
+            recovery_errors = list(getattr(exc, "recovery_errors", []))
+            if (isinstance(exc, LifecycleFailure) and exc.stage == "receipt") or isinstance(
+                exc, PermissionError
+            ):
+                try:
+                    _restore_receipt_owned_from_backup(
+                        destination,
+                        rollback,
+                        receipt.get("managed_files", []),
+                    )
+                except (OSError, LifecycleFailure) as recovery_error:
+                    recovery_errors.append(
+                        {"type": type(recovery_error).__name__, "reason": str(recovery_error)}
+                    )
+                try:
+                    for record in receipt.get("managed_files", []):
+                        path = _safe_receipt_path(destination, record.get("path"), "managed file")
+                        _receipt_file_identity(path, "managed file")
+                        if _sha256(path) != record.get("sha256"):
+                            recovery_errors.append(
+                                {
+                                    "path": str(path),
+                                    "reason": "Managed file does not match the retained receipt",
+                                }
+                            )
+                except (OSError, LifecycleFailure) as recovery_error:
+                    recovery_errors.append(
+                        {"type": type(recovery_error).__name__, "reason": str(recovery_error)}
+                    )
             else:
                 _restore_backup(destination, rollback)
             _safe_restore_receipt(destination, prior_receipt)
-            _remove_backup(destination, rollback)
+            if recovery_errors:
+                original_failure = exc.__cause__ if exc.__cause__ is not None else exc
+                detected.update(
+                    {
+                        "recovery_status": "incomplete",
+                        "recovery_errors": recovery_errors,
+                        "original_failure": {
+                            "type": type(original_failure).__name__,
+                            "reason": str(original_failure),
+                        },
+                        "recovery_backup_root": str(destination / str(rollback["root"])),
+                    }
+                )
+            else:
+                _remove_backup(destination, rollback)
             raise
         finally:
             receipt_parent.close()
