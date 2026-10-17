@@ -1898,12 +1898,12 @@ def test_repair_uninstall_invalidates_only_source_backed_generated_cache(
     assert (
         cache.parent / "previous_orphan.cpython-39.pyc"
     ).read_bytes() == b"previous source-less cache"
+    assert not cache.exists()
     # The only executed module is this private inert old-source fixture.
     spec = importlib.util.spec_from_file_location("restored_cache_probe", module / "__init__.py")
     restored = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(restored)
     assert restored.PREVIOUS is True
-    assert not cache.exists()
 
 
 @pytest.mark.parametrize(
@@ -1911,6 +1911,7 @@ def test_repair_uninstall_invalidates_only_source_backed_generated_cache(
     [
         "conflict",
         "cache-replacement",
+        "cache-between-validation",
         "cache-parent-replacement",
         "cache-locked",
         "backup-cache-symlink",
@@ -1930,6 +1931,7 @@ def test_repair_cache_invalidation_preserves_fail_closed_recovery(
         record["path"]: (request.destination / record["path"]).read_bytes() for record in managed
     }
     cache_bytes = cache.read_bytes()
+    original_cache_identity = installer._receipt_file_identity(cache, "generated cache")
     victim = tmp_path / "operator-victim.txt"
     victim.write_bytes(b"operator victim")
     if failure == "conflict":
@@ -1960,6 +1962,23 @@ def test_repair_cache_invalidation_preserves_fail_closed_recovery(
     interrupted = False
     original_unlink = installer._ReceiptParentHandle.unlink
     original_remove = installer._remove_receipt_owned_files
+    original_digest = installer._ReceiptParentHandle.digest
+    retained_cache = tmp_path / "retained-original-cache.bin"
+
+    def replace_between_passes(handle, name):
+        nonlocal interrupted
+        digest = original_digest(handle, name)
+        if handle.path / name == request.destination / managed[-1]["path"] and not interrupted:
+            interrupted = True
+            attributes = cache.stat()
+            cache.rename(retained_cache)
+            cache.write_bytes(cache_bytes)
+            os.utime(cache, ns=(attributes.st_atime_ns, attributes.st_mtime_ns))
+            replacement = installer._receipt_file_identity(cache, "generated cache")
+            assert replacement[0] == original_cache_identity[0]
+            assert replacement[1] != original_cache_identity[1]
+            assert replacement[2:] == original_cache_identity[2:]
+        return digest
 
     def remove_with_parent_swap(destination, records, *args, **kwargs):
         nonlocal interrupted
@@ -1986,6 +2005,8 @@ def test_repair_cache_invalidation_preserves_fail_closed_recovery(
         monkeypatch.setattr(installer, "_remove_receipt_owned_files", remove_with_parent_swap)
     if failure in {"cache-replacement", "cache-locked"}:
         monkeypatch.setattr(installer._ReceiptParentHandle, "unlink", interrupt_cache)
+    if failure == "cache-between-validation":
+        monkeypatch.setattr(installer._ReceiptParentHandle, "digest", replace_between_passes)
     result = installer.run_lifecycle(request.with_operation("uninstall"))
     assert result["exit_code"] == (50 if failure == "cache-locked" else 10)
     assert result["stage"] == ("locked_files" if failure == "cache-locked" else "receipt")
@@ -2001,8 +2022,20 @@ def test_repair_cache_invalidation_preserves_fail_closed_recovery(
         if path.is_symlink() or path.is_file()
     } == original_backup
     assert victim.read_bytes() == b"operator victim"
-    if failure in {"cache-replacement", "cache-locked", "cache-parent-replacement"}:
+    if failure in {
+        "cache-replacement",
+        "cache-between-validation",
+        "cache-locked",
+        "cache-parent-replacement",
+    }:
         assert interrupted
+    if failure == "cache-between-validation":
+        assert retained_cache.read_bytes() == cache_bytes
+        assert (
+            installer._receipt_file_identity(retained_cache, "generated cache")
+            == original_cache_identity
+        )
+        assert installer._receipt_file_identity(cache, "generated cache") != original_cache_identity
     if failure == "cache-replacement":
         assert cache.read_bytes() == b"operator cache replacement"
     elif failure != "runtime-cache-symlink":

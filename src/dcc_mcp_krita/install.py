@@ -830,6 +830,9 @@ def _remove_receipt_owned_files(
         for path, expected_digest, parent_handle in validated:
             parent_handle.revalidate()
             before_identity = parent_handle.child_identity(path.name)
+            if expected_paths and path in expected_paths:
+                if before_identity != expected_paths[path][0]:
+                    raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Generated cache changed")
             if parent_handle.digest(path.name) != expected_digest:
                 raise LifecycleFailure(EXIT_PREFLIGHT, "receipt", "Receipt-owned path changed")
             parent_handle.revalidate()
