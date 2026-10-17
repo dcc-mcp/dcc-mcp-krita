@@ -902,22 +902,49 @@ def _restore_backup(
                 staged: list[tuple[Path, Path, tuple[int, int, int, int], str]] = []
                 for index, (source, target) in enumerate(files):
                     identity = _receipt_file_identity(source, "backup file")
-                    digest = _sha256(source)
                     staged_file = Path(staging) / str(index)
-                    shutil.copy2(source, staged_file)
-                    if (
-                        _receipt_file_identity(source, "backup file") != identity
-                        or _sha256(staged_file) != digest
-                    ):
-                        raise LifecycleFailure(
-                            EXIT_PREFLIGHT, "receipt", "Backup file changed during restore"
+                    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+                    descriptor = os.open(source, flags)
+                    with os.fdopen(descriptor, "rb") as original:
+                        attributes = os.fstat(original.fileno())
+                        opened_identity = (
+                            int(attributes.st_dev),
+                            int(attributes.st_ino),
+                            int(attributes.st_size),
+                            int(attributes.st_mtime_ns),
                         )
+                        if (
+                            _is_reparse_point(source, attributes)
+                            or not stat.S_ISREG(attributes.st_mode)
+                            or opened_identity != identity
+                        ):
+                            raise LifecycleFailure(
+                                EXIT_PREFLIGHT, "receipt", "Backup file changed during restore"
+                            )
+                        digest = hashlib.sha256()
+                        with staged_file.open("xb") as copied:
+                            for chunk in iter(lambda: original.read(1024 * 1024), b""):
+                                copied.write(chunk)
+                                digest.update(chunk)
+                        after = os.fstat(original.fileno())
+                        if (
+                            int(after.st_dev),
+                            int(after.st_ino),
+                            int(after.st_size),
+                            int(after.st_mtime_ns),
+                        ) != identity:
+                            raise LifecycleFailure(
+                                EXIT_PREFLIGHT, "receipt", "Backup file changed during restore"
+                            )
+                    # Metadata belongs to the held inode, never to a reopened path.
+                    os.chmod(staged_file, stat.S_IMODE(attributes.st_mode))
+                    os.utime(staged_file, ns=(attributes.st_atime_ns, attributes.st_mtime_ns))
                     staged.append(
                         (
                             staged_file,
                             target,
                             _receipt_file_identity(staged_file, "backup file"),
-                            digest,
+                            digest.hexdigest(),
                         )
                     )
                 published: list[
@@ -969,15 +996,33 @@ def _restore_backup(
                                 raise LifecycleFailure(
                                     EXIT_PREFLIGHT, "receipt", "Backup restore path changed"
                                 )
-                    except BaseException:
+                    except BaseException as exc:
                         # Remove only our identity-bound publications. The existing
                         # receipt-stage recovery then restores missing managed files
                         # without recursively deleting operator data or replacements.
+                        recovery_errors = []
                         for parent, name, identity, digest in reversed(published):
-                            parent.unlink(name, expected_identity=identity, expected_digest=digest)
+                            try:
+                                parent.unlink(
+                                    name, expected_identity=identity, expected_digest=digest
+                                )
+                            except (OSError, LifecycleFailure) as cleanup_error:
+                                recovery_errors.append(
+                                    {
+                                        "path": str(parent.path / name),
+                                        "type": type(cleanup_error).__name__,
+                                        "reason": str(cleanup_error),
+                                    }
+                                )
+                        if recovery_errors:
+                            exc.recovery_errors = recovery_errors
                         raise
+        except PermissionError:
+            raise
         except OSError as exc:
-            raise LifecycleFailure(EXIT_INSTALL, "receipt", str(exc)) from exc
+            failure = LifecycleFailure(EXIT_INSTALL, "receipt", str(exc))
+            failure.recovery_errors = getattr(exc, "recovery_errors", [])
+            raise failure from exc
         return
     _remove_plugin_files(destination)
     backup_root = destination / str(backup.get("root", ""))
@@ -1469,16 +1514,53 @@ def run_lifecycle(request: LifecycleRequest) -> dict[str, Any]:
             # Receipt validation failures are fail-closed: do not recursively
             # delete the plug-in tree while rolling back, because that could
             # remove an operator-owned replacement discovered in the race.
-            if isinstance(exc, LifecycleFailure) and exc.stage == "receipt":
-                _restore_receipt_owned_from_backup(
-                    destination,
-                    rollback,
-                    receipt.get("managed_files", []),
-                )
+            recovery_errors = list(getattr(exc, "recovery_errors", []))
+            if (isinstance(exc, LifecycleFailure) and exc.stage == "receipt") or isinstance(
+                exc, PermissionError
+            ):
+                try:
+                    _restore_receipt_owned_from_backup(
+                        destination,
+                        rollback,
+                        receipt.get("managed_files", []),
+                    )
+                except (OSError, LifecycleFailure) as recovery_error:
+                    recovery_errors.append(
+                        {"type": type(recovery_error).__name__, "reason": str(recovery_error)}
+                    )
+                try:
+                    for record in receipt.get("managed_files", []):
+                        path = _safe_receipt_path(destination, record.get("path"), "managed file")
+                        _receipt_file_identity(path, "managed file")
+                        if _sha256(path) != record.get("sha256"):
+                            recovery_errors.append(
+                                {
+                                    "path": str(path),
+                                    "reason": "Managed file does not match the retained receipt",
+                                }
+                            )
+                except (OSError, LifecycleFailure) as recovery_error:
+                    recovery_errors.append(
+                        {"type": type(recovery_error).__name__, "reason": str(recovery_error)}
+                    )
             else:
                 _restore_backup(destination, rollback)
             _safe_restore_receipt(destination, prior_receipt)
-            _remove_backup(destination, rollback)
+            if recovery_errors:
+                original_failure = exc.__cause__ if exc.__cause__ is not None else exc
+                detected.update(
+                    {
+                        "recovery_status": "incomplete",
+                        "recovery_errors": recovery_errors,
+                        "original_failure": {
+                            "type": type(original_failure).__name__,
+                            "reason": str(original_failure),
+                        },
+                        "recovery_backup_root": str(destination / str(rollback["root"])),
+                    }
+                )
+            else:
+                _remove_backup(destination, rollback)
             raise
         finally:
             receipt_parent.close()

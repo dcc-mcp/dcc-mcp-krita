@@ -265,17 +265,18 @@ def test_repair_uninstall_preserves_receipt_backup_and_operator_data_on_conflict
     if conflict in {"publish-race", "publish-error"}:
         monkeypatch.setattr(installer.os, publication, interrupt_publication)
     if conflict == "copy-error":
-        original_copy = installer.shutil.copy2
+        original_open = Path.open
 
-        def interrupt_copy(source, target, *args, **kwargs):
+        def interrupt_copy(target, *args, **kwargs):
             nonlocal interrupted
-            if Path(target).parent.name.startswith(".krita-restore-") and not interrupted:
-                Path(target).write_bytes(b"partial backup restore")
+            if target.parent.name.startswith(".krita-restore-") and not interrupted:
+                with original_open(target, "wb") as stream:
+                    stream.write(b"partial backup restore")
                 interrupted = True
                 raise OSError("restore copy interrupted")
-            return original_copy(source, target, *args, **kwargs)
+            return original_open(target, *args, **kwargs)
 
-        monkeypatch.setattr(installer.shutil, "copy2", interrupt_copy)
+        monkeypatch.setattr(Path, "open", interrupt_copy)
     result = run_lifecycle(request.with_operation("uninstall"))
 
     assert result["exit_code"] == (30 if conflict in {"publish-error", "copy-error"} else 10)
@@ -303,6 +304,196 @@ def test_repair_uninstall_preserves_receipt_backup_and_operator_data_on_conflict
     elif conflict == "copy-error":
         assert interrupted
         assert result["reason"] == "restore copy interrupted"
+
+
+@pytest.fixture
+def repair_restore_case(tmp_path: Path, monkeypatch):
+    import dcc_mcp_krita.install as installer
+
+    monkeypatch.setattr(
+        installer.subprocess,
+        "run",
+        lambda *args, **kwargs: type("Probe", (), {"returncode": 0, "stdout": "Krita 5.2.11\n"})(),
+    )
+    destination = tmp_path / "pykrita"
+    module = destination / "dcc_mcp_krita"
+    module.mkdir(parents=True)
+    (destination / "dcc_mcp_krita.desktop").write_bytes(b"previous desktop\n")
+    (module / "__init__.py").write_bytes(b"PREVIOUS = True\n")
+    (module / "legacy.txt").write_bytes(b"original legacy\n")
+    host = tmp_path / "krita.exe"
+    host.touch()
+    request = installer.LifecycleRequest(
+        operation="install",
+        dcc_path=host,
+        python_path=Path(sys.executable),
+        destination=destination,
+        yes=True,
+        repair=True,
+    )
+    assert installer.run_lifecycle(request)["exit_code"] == 0
+    receipt = destination / ".dcc-mcp/receipts/krita.json"
+    original_receipt = receipt.read_bytes()
+    payload = json.loads(original_receipt)
+    backup = destination / payload["backup"]["root"]
+    managed = {
+        record["path"]: (destination / record["path"]).read_bytes()
+        for record in payload["managed_files"]
+    }
+    (module / "operator.txt").write_bytes(b"operator-owned\n")
+    return installer, request, module, receipt, original_receipt, backup, managed
+
+
+def test_backup_restore_cannot_copy_a_swapped_source_inode(
+    repair_restore_case, monkeypatch
+) -> None:
+    installer, request, module, receipt, original_receipt, backup, managed = repair_restore_case
+    legacy = backup / "dcc_mcp_krita/legacy.txt"
+    original_stat = legacy.stat()
+    saved = legacy.with_name("legacy-held.txt")
+    original_digest = installer._sha256
+    original_copy = installer.shutil.copy2
+    original_open = installer.os.open
+    swapped = False
+    attempted = False
+
+    def swap_source() -> None:
+        nonlocal swapped, attempted
+        attempted = True
+        try:
+            legacy.rename(saved)
+        except PermissionError:
+            # Windows may prevent renaming a held source descriptor outright.
+            return
+        legacy.write_bytes(b"foreign source\n")
+        swapped = True
+
+    def digest_after_swap(path):
+        if Path(path) == legacy and not attempted:
+            swap_source()
+        return original_digest(path)
+
+    def restore_after_copy(source, target, *args, **kwargs):
+        value = original_copy(source, target, *args, **kwargs)
+        if Path(source) == legacy and swapped:
+            legacy.unlink()
+            saved.rename(legacy)
+        return value
+
+    def swap_after_descriptor_open(path, *args, **kwargs):
+        descriptor = original_open(path, *args, **kwargs)
+        if not isinstance(path, int) and Path(path) == legacy and not attempted:
+            swap_source()
+        return descriptor
+
+    monkeypatch.setattr(installer, "_sha256", digest_after_swap)
+    monkeypatch.setattr(installer.shutil, "copy2", restore_after_copy)
+    monkeypatch.setattr(installer.os, "open", swap_after_descriptor_open)
+    try:
+        result = installer.run_lifecycle(request.with_operation("uninstall"))
+    finally:
+        if saved.exists():
+            legacy.unlink()
+            saved.rename(legacy)
+
+    assert attempted
+    assert result["exit_code"] == 0
+    assert (module / "legacy.txt").read_bytes() == b"original legacy\n"
+    assert (module / "legacy.txt").stat().st_mtime_ns == original_stat.st_mtime_ns
+    assert (module / "legacy.txt").stat().st_mode == original_stat.st_mode
+    assert (module / "operator.txt").read_bytes() == b"operator-owned\n"
+    assert not receipt.exists()
+
+
+@pytest.mark.parametrize("phase", ["owned-delete", "publication"])
+def test_backup_restore_permission_error_preserves_restart_contract(
+    repair_restore_case, monkeypatch, phase: str
+) -> None:
+    installer, request, module, receipt, original_receipt, backup, managed = repair_restore_case
+    original_unlink = installer._ReceiptParentHandle.unlink
+    publication = "rename" if os.name == "nt" else "link"
+    original_publication = getattr(installer.os, publication)
+
+    def locked_delete(parent, name, *args, **kwargs):
+        if phase == "owned-delete":
+            raise PermissionError("owned file is locked")
+        return original_unlink(parent, name, *args, **kwargs)
+
+    def locked_publication(source, target, *args, **kwargs):
+        if Path(source).parent.name.startswith(".krita-restore-"):
+            raise PermissionError("restore destination is locked")
+        return original_publication(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(installer._ReceiptParentHandle, "unlink", locked_delete)
+    if phase == "publication":
+        monkeypatch.setattr(installer.os, publication, locked_publication)
+    result = installer.run_lifecycle(request.with_operation("uninstall"))
+
+    assert result["exit_code"] == 50
+    assert result["status"] == "requires_restart"
+    assert result["stage"] == "locked_files"
+    assert receipt.read_bytes() == original_receipt
+    assert all(
+        (request.destination / path).read_bytes() == content for path, content in managed.items()
+    )
+    assert (module / "operator.txt").read_bytes() == b"operator-owned\n"
+    assert (backup / "dcc_mcp_krita/legacy.txt").read_bytes() == b"original legacy\n"
+
+
+@pytest.mark.parametrize("cleanup_failure", ["locked", "replacement"])
+def test_backup_restore_attempts_all_cleanup_and_retains_incomplete_recovery(
+    repair_restore_case, monkeypatch, cleanup_failure: str
+) -> None:
+    installer, request, module, receipt, original_receipt, backup, managed = repair_restore_case
+    publication = "rename" if os.name == "nt" else "link"
+    original_publication = getattr(installer.os, publication)
+    original_unlink = installer._ReceiptParentHandle.unlink
+    failed = False
+    cleanup_attempts = []
+
+    def fail_last_publication(source, target, *args, **kwargs):
+        nonlocal failed
+        if Path(target).name == "legacy.txt" and Path(source).parent.name.startswith(
+            ".krita-restore-"
+        ):
+            failed = True
+            if cleanup_failure == "replacement":
+                (module / "__init__.py").unlink()
+                (module / "__init__.py").write_bytes(b"operator replacement\n")
+            raise OSError("original publication failure")
+        return original_publication(source, target, *args, **kwargs)
+
+    def fail_one_cleanup(parent, name, *args, **kwargs):
+        if failed:
+            cleanup_attempts.append(name)
+            if name == "__init__.py" and cleanup_failure == "locked":
+                raise PermissionError("published file locked during recovery")
+        return original_unlink(parent, name, *args, **kwargs)
+
+    monkeypatch.setattr(installer.os, publication, fail_last_publication)
+    monkeypatch.setattr(installer._ReceiptParentHandle, "unlink", fail_one_cleanup)
+    result = installer.run_lifecycle(request.with_operation("uninstall"))
+
+    assert "dcc_mcp_krita.desktop" in cleanup_attempts
+    assert result["exit_code"] == 30
+    assert result["reason"] == "original publication failure"
+    assert result["detected"]["recovery_status"] == "incomplete"
+    assert result["detected"]["recovery_errors"]
+    assert result["detected"]["original_failure"] == {
+        "type": "OSError",
+        "reason": "original publication failure",
+    }
+    assert Path(result["detected"]["recovery_backup_root"]).is_dir()
+    assert receipt.read_bytes() == original_receipt
+    assert (request.destination / "dcc_mcp_krita.desktop").read_bytes() == managed[
+        "dcc_mcp_krita.desktop"
+    ]
+    expected_init = (
+        b"operator replacement\n" if cleanup_failure == "replacement" else b"PREVIOUS = True\n"
+    )
+    assert (module / "__init__.py").read_bytes() == expected_init
+    assert (module / "operator.txt").read_bytes() == b"operator-owned\n"
+    assert (backup / "dcc_mcp_krita/legacy.txt").read_bytes() == b"original legacy\n"
 
 
 def test_receipt_failure_rolls_back_repair_to_previous_plugin(tmp_path: Path, monkeypatch) -> None:
