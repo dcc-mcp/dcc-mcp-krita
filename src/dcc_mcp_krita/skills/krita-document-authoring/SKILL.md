@@ -53,4 +53,10 @@ Krita host is usable; only `verify` with an authenticated bridge can establish
 that boundary.
 
 For removal, use `dcc-mcp-krita uninstall --dcc-path /path/to/krita --yes --json`;
-it deletes only files recorded by the install receipt.
+it removes receipt-owned files and restores pre-existing plug-in files. When
+restoring a receipt-owned Python source, its source-associated `__pycache__`
+bytecode is invalidated rather than restored, including caches created after
+installation. Legacy/source-less bytecode and other operator files are preserved
+or reported as explicit path conflicts. Generated caches may also be invalidated
+during a failed restore; source files, the receipt, and other operator data retain
+the existing recovery rules.
