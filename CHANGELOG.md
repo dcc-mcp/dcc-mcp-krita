@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.1](https://github.com/dcc-mcp/dcc-mcp-krita/compare/v0.5.0...v0.5.1) (2026-11-15)
+
+
+### Documentation
+
+* refresh the generated DCC-MCP host matrix pointer ([afceaf3](https://github.com/dcc-mcp/dcc-mcp-krita/commit/afceaf3b4bf3038bcb25ff01717488bab3c3e0ae))
+* refresh the generated DCC-MCP host matrix pointer ([d8363bb](https://github.com/dcc-mcp/dcc-mcp-krita/commit/d8363bb393b95cb654d75fabab0cf395b087364e))
+
 ## [0.5.0](https://github.com/dcc-mcp/dcc-mcp-krita/compare/v0.4.0...v0.5.0) (2026-10-17)
 
 
